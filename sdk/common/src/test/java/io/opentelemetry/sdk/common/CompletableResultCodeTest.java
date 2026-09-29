@@ -1,0 +1,336 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.sdk.common;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
+
+import com.google.common.util.concurrent.Uninterruptibles;
+import io.opentelemetry.internal.testing.slf4j.SuppressLogger;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.Test;
+
+class CompletableResultCodeTest {
+
+  @Test
+  void ofSuccess() {
+    assertThat(CompletableResultCode.ofSuccess())
+        .satisfies(
+            code -> {
+              assertThat(code.isSuccess()).isTrue();
+              assertThat(code.getFailureThrowable()).isNull();
+            });
+  }
+
+  @Test
+  void ofFailure() {
+    assertThat(CompletableResultCode.ofFailure())
+        .satisfies(
+            code -> {
+              assertThat(code.isSuccess()).isFalse();
+              assertThat(code.getFailureThrowable()).isNull();
+            });
+  }
+
+  @Test
+  void ofExceptionalFailure() {
+    assertThat(CompletableResultCode.ofExceptionalFailure(new Exception("error")))
+        .satisfies(
+            code -> {
+              assertThat(code.isSuccess()).isFalse();
+              assertThat(code.getFailureThrowable()).hasMessage("error");
+            });
+  }
+
+  @Test
+  void succeed() throws InterruptedException {
+    CompletableResultCode resultCode = new CompletableResultCode();
+
+    CountDownLatch completions = new CountDownLatch(1);
+
+    new Thread(resultCode::succeed).start();
+
+    resultCode.whenComplete(completions::countDown);
+
+    completions.await(3, TimeUnit.SECONDS);
+
+    assertThat(resultCode.isSuccess()).isTrue();
+  }
+
+  @Test
+  void fail() throws InterruptedException {
+    CompletableResultCode resultCode = new CompletableResultCode();
+
+    CountDownLatch completions = new CountDownLatch(1);
+
+    new Thread(resultCode::fail).start();
+
+    resultCode.whenComplete(completions::countDown);
+
+    completions.await(3, TimeUnit.SECONDS);
+
+    assertThat(resultCode.isSuccess()).isFalse();
+  }
+
+  @Test
+  void failExceptionallyWithNull() {
+    CompletableResultCode resultCode = new CompletableResultCode();
+    CompletableResultCode result = resultCode.failExceptionally(null);
+    assertThat(result.isDone()).isTrue();
+    assertThat(result.isSuccess()).isFalse();
+    assertThat(result.getFailureThrowable()).isNull();
+  }
+
+  @Test
+  void whenDoublyCompleteSuccessfully() throws InterruptedException {
+    CompletableResultCode resultCode = new CompletableResultCode();
+
+    CountDownLatch completions = new CountDownLatch(2);
+
+    new Thread(resultCode::succeed).start();
+
+    resultCode.whenComplete(completions::countDown).whenComplete(completions::countDown);
+
+    completions.await(3, TimeUnit.SECONDS);
+
+    assertThat(resultCode.isSuccess()).isTrue();
+  }
+
+  @Test
+  void whenDoublyNestedComplete() throws InterruptedException {
+    CompletableResultCode resultCode = new CompletableResultCode();
+
+    CountDownLatch completions = new CountDownLatch(2);
+
+    new Thread(resultCode::succeed).start();
+
+    resultCode.whenComplete(
+        () -> {
+          completions.countDown();
+
+          resultCode.whenComplete(completions::countDown);
+        });
+
+    completions.await(3, TimeUnit.SECONDS);
+
+    assertThat(resultCode.isSuccess()).isTrue();
+  }
+
+  @Test
+  void whenSuccessThenFailure() throws InterruptedException {
+    CompletableResultCode resultCode = new CompletableResultCode();
+
+    CountDownLatch completions = new CountDownLatch(1);
+
+    new Thread(() -> resultCode.succeed().fail()).start();
+
+    resultCode.whenComplete(completions::countDown);
+
+    completions.await(3, TimeUnit.SECONDS);
+
+    assertThat(resultCode.isSuccess()).isTrue();
+  }
+
+  @Test
+  void isDone() {
+    CompletableResultCode result = new CompletableResultCode();
+    assertThat(result.isDone()).isFalse();
+    result.fail();
+    assertThat(result.isDone()).isTrue();
+  }
+
+  @Test
+  void ofAll() {
+    CompletableResultCode result1 = new CompletableResultCode();
+    CompletableResultCode result2 = new CompletableResultCode();
+    CompletableResultCode result3 = new CompletableResultCode();
+
+    CompletableResultCode all =
+        CompletableResultCode.ofAll(Arrays.asList(result1, result2, result3));
+    assertThat(all.isDone()).isFalse();
+    result1.succeed();
+    assertThat(all.isDone()).isFalse();
+    result2.succeed();
+    assertThat(all.isDone()).isFalse();
+    result3.succeed();
+    assertThat(all.isDone()).isTrue();
+    assertThat(all.isSuccess()).isTrue();
+
+    assertThat(CompletableResultCode.ofAll(Collections.emptyList()).isSuccess()).isTrue();
+  }
+
+  @Test
+  void ofAllWithFailure() {
+    assertThat(
+            CompletableResultCode.ofAll(
+                    Arrays.asList(
+                        CompletableResultCode.ofSuccess(),
+                        CompletableResultCode.ofFailure(),
+                        CompletableResultCode.ofSuccess()))
+                .isSuccess())
+        .isFalse();
+  }
+
+  @Test
+  void ofAllWithExceptionalFailure() {
+    assertThat(
+            CompletableResultCode.ofAll(
+                Arrays.asList(
+                    CompletableResultCode.ofSuccess(),
+                    CompletableResultCode.ofFailure(),
+                    CompletableResultCode.ofExceptionalFailure(new Exception("error1")),
+                    CompletableResultCode.ofExceptionalFailure(new Exception("error2")),
+                    CompletableResultCode.ofSuccess())))
+        .satisfies(
+            code -> {
+              assertThat(code.isSuccess()).isFalse();
+              // failure throwable is set to first throwable seen in the collection
+              assertThat(code.getFailureThrowable()).hasMessage("error1");
+            });
+  }
+
+  @Test
+  void join() {
+    CompletableResultCode result = new CompletableResultCode();
+    new Thread(
+            () -> {
+              Uninterruptibles.sleepUninterruptibly(Duration.ofMillis(50));
+              result.succeed();
+            })
+        .start();
+    assertThat(result.join(10, TimeUnit.SECONDS).isSuccess()).isTrue();
+    // Already completed, synchronous call.
+    assertThat(result.join(0, TimeUnit.NANOSECONDS).isSuccess()).isTrue();
+  }
+
+  @Test
+  void joinTimesOut() {
+    CompletableResultCode result = new CompletableResultCode();
+    assertThat(result.join(1, TimeUnit.MILLISECONDS).isSuccess()).isFalse();
+    assertThat(result.isDone()).isFalse();
+  }
+
+  @Test
+  void joinInterrupted() {
+    CompletableResultCode result = new CompletableResultCode();
+    AtomicReference<Boolean> interrupted = new AtomicReference<>();
+    Thread thread =
+        new Thread(
+            () -> {
+              result.join(10, TimeUnit.SECONDS);
+              interrupted.set(Thread.currentThread().isInterrupted());
+            });
+    thread.start();
+    thread.interrupt();
+    // Different thread so wait a bit for result to be propagated.
+    await().untilAsserted(() -> assertThat(interrupted).hasValue(true));
+    assertThat(result.isSuccess()).isFalse();
+    assertThat(result.isDone()).isFalse();
+  }
+
+  @Test
+  void callbackCompletionAnotherResultDoesNotDeadlock() throws InterruptedException {
+    CompletableResultCode first = new CompletableResultCode();
+    CompletableResultCode second = new CompletableResultCode();
+    CountDownLatch callbackEntered = new CountDownLatch(2);
+    CountDownLatch release = new CountDownLatch(1);
+
+    first.whenComplete(
+        () -> {
+          callbackEntered.countDown();
+          Uninterruptibles.awaitUninterruptibly(release);
+          second.succeed();
+        });
+
+    second.whenComplete(
+        () -> {
+          callbackEntered.countDown();
+          Uninterruptibles.awaitUninterruptibly(release);
+          first.succeed();
+        });
+
+    Thread firstThread = new Thread(first::succeed, "complete-first");
+    Thread secondThread = new Thread(second::succeed, "complete-second");
+    firstThread.setDaemon(true);
+    secondThread.setDaemon(true);
+    firstThread.start();
+    secondThread.start();
+
+    assertThat(callbackEntered.await(10, TimeUnit.SECONDS)).isTrue();
+    release.countDown();
+
+    firstThread.join(10_000);
+    secondThread.join(10_000);
+
+    assertThat(firstThread.isAlive()).isFalse();
+    assertThat(secondThread.isAlive()).isFalse();
+    assertThat(first.isSuccess()).isTrue();
+    assertThat(second.isSuccess()).isTrue();
+  }
+
+  @Test
+  @SuppressLogger(CompletableResultCode.class)
+  void completionActionExceptionDoesNotAbortLaterActions() {
+    CompletableResultCode result = new CompletableResultCode();
+    AtomicBoolean actionInvoked = new AtomicBoolean();
+
+    result.whenComplete(
+        () -> {
+          throw new RuntimeException("callback failure");
+        });
+    result.whenComplete(() -> actionInvoked.set(true));
+    assertThatThrownBy(result::succeed)
+        .isInstanceOf(RuntimeException.class)
+        .hasMessage("callback failure");
+
+    assertThat(actionInvoked).isTrue();
+    assertThat(result.isSuccess()).isTrue();
+  }
+
+  @Test
+  @SuppressLogger(CompletableResultCode.class)
+  void completionActionExceptionDoesNotPreventOfAllCompletion() {
+    CompletableResultCode source = new CompletableResultCode();
+    CompletableResultCode other = new CompletableResultCode();
+
+    // Registered before ofAll so that it runs before ofAll's bookkeeping action.
+    source.whenComplete(
+        () -> {
+          throw new RuntimeException("callback failure");
+        });
+    CompletableResultCode all = CompletableResultCode.ofAll(Arrays.asList(source, other));
+    other.succeed();
+
+    assertThatThrownBy(source::succeed)
+        .isInstanceOf(RuntimeException.class)
+        .hasMessage("callback failure");
+
+    assertThat(all.isDone()).isTrue();
+    assertThat(all.isSuccess()).isTrue();
+  }
+
+  @Test
+  @SuppressLogger(CompletableResultCode.class)
+  void completionActionExceptionPropagatesWhenAlreadyComplete() {
+    CompletableResultCode result = new CompletableResultCode().succeed();
+
+    assertThatThrownBy(
+            () ->
+                result.whenComplete(
+                    () -> {
+                      throw new RuntimeException("callback failure");
+                    }))
+        .isInstanceOf(RuntimeException.class)
+        .hasMessage("callback failure");
+  }
+}

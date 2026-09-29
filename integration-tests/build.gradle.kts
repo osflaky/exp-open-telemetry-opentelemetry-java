@@ -1,0 +1,24 @@
+plugins {
+  id("otel.java-conventions")
+}
+
+description = "OpenTelemetry Integration Tests"
+otelJava.moduleName.set("io.opentelemetry.integration.tests")
+otelJava.requireSuppressWarningsExplanation.set(false)
+otelJava.osgiEnabled.set(false)
+
+dependencies {
+  testImplementation(project(":sdk:all"))
+  testImplementation(project(":sdk:testing"))
+  testImplementation(project(":extensions:trace-propagators"))
+
+  testImplementation("com.linecorp.armeria:armeria-junit5")
+  testImplementation("io.github.crac:org-crac")
+  testImplementation("org.junit.jupiter:junit-jupiter-params")
+  testImplementation("org.testcontainers:testcontainers-junit-jupiter")
+}
+
+// Skip ossIndexAudit on test module
+tasks.named("ossIndexAudit") {
+  enabled = false
+}

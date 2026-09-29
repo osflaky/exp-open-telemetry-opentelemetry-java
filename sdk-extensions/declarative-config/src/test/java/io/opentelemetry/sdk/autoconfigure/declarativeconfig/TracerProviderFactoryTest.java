@@ -1,0 +1,143 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.sdk.autoconfigure.declarativeconfig;
+
+import static io.opentelemetry.sdk.testing.assertj.OpenTelemetryAssertions.assertThat;
+import static io.opentelemetry.sdk.trace.samplers.Sampler.alwaysOn;
+
+import io.opentelemetry.common.ComponentLoader;
+import io.opentelemetry.exporter.otlp.http.trace.OtlpHttpSpanExporter;
+import io.opentelemetry.internal.testing.CleanupExtension;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.AlwaysOnSamplerModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.AttributeLimitsModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.BatchSpanProcessorModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.OtlpHttpExporterModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.SamplerModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.SpanExporterModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.SpanLimitsModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.SpanProcessorModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.TracerProviderModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.internal.ExperimentalTracerConfigModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.internal.ExperimentalTracerConfiguratorModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.internal.ExperimentalTracerMatcherAndConfigModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.internal.TracerProviderModelAccessor;
+import io.opentelemetry.sdk.common.internal.ScopeConfigurator;
+import io.opentelemetry.sdk.common.internal.ScopeConfiguratorBuilder;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.SdkTracerProviderBuilder;
+import io.opentelemetry.sdk.trace.SpanLimits;
+import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
+import io.opentelemetry.sdk.trace.internal.SdkTracerProviderUtil;
+import io.opentelemetry.sdk.trace.internal.TracerConfig;
+import java.io.Closeable;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+class TracerProviderFactoryTest {
+
+  @RegisterExtension CleanupExtension cleanup = new CleanupExtension();
+
+  private static final DeclarativeConfigContext context =
+      new DeclarativeConfigContext(
+          ComponentLoader.forClassLoader(TracerProviderFactoryTest.class.getClassLoader()));
+
+  @BeforeEach
+  void setup() {
+    context.setBuilder(new DeclarativeConfigurationBuilder());
+  }
+
+  @ParameterizedTest
+  @MethodSource("createArguments")
+  void create(TracerProviderAndAttributeLimits model, SdkTracerProvider expectedProvider) {
+    List<Closeable> closeables = new ArrayList<>();
+    cleanup.addCloseable(expectedProvider);
+
+    SdkTracerProvider provider = TracerProviderFactory.getInstance().create(model, context).build();
+    cleanup.addCloseable(provider);
+    cleanup.addCloseables(closeables);
+
+    assertThat(provider.toString()).isEqualTo(expectedProvider.toString());
+  }
+
+  private static Stream<Arguments> createArguments() {
+    return Stream.of(
+        Arguments.argumentSet(
+            "null limits",
+            TracerProviderAndAttributeLimits.create(null, null),
+            SdkTracerProvider.builder().build()),
+        Arguments.argumentSet(
+            "empty models",
+            TracerProviderAndAttributeLimits.create(
+                new AttributeLimitsModel(), new TracerProviderModel()),
+            SdkTracerProvider.builder().build()),
+        Arguments.argumentSet(
+            "full configuration",
+            TracerProviderAndAttributeLimits.create(
+                new AttributeLimitsModel(),
+                TracerProviderModelAccessor.setTracerConfigurator(
+                    new TracerProviderModel()
+                        .setLimits(
+                            new SpanLimitsModel()
+                                .setAttributeCountLimit(1)
+                                .setAttributeValueLengthLimit(2)
+                                .setEventCountLimit(3)
+                                .setLinkCountLimit(4)
+                                .setEventAttributeCountLimit(5)
+                                .setLinkAttributeCountLimit(6))
+                        .setSampler(new SamplerModel().setAlwaysOn(new AlwaysOnSamplerModel()))
+                        .setProcessors(
+                            Collections.singletonList(
+                                new SpanProcessorModel()
+                                    .setBatch(
+                                        new BatchSpanProcessorModel()
+                                            .setExporter(
+                                                new SpanExporterModel()
+                                                    .setOtlpHttp(new OtlpHttpExporterModel()))))),
+                    new ExperimentalTracerConfiguratorModel()
+                        .setDefaultConfig(new ExperimentalTracerConfigModel().setEnabled(false))
+                        .setTracers(
+                            Collections.singletonList(
+                                new ExperimentalTracerMatcherAndConfigModel()
+                                    .setName("foo")
+                                    .setConfig(
+                                        new ExperimentalTracerConfigModel().setEnabled(true)))))),
+            addTracerConfigurator(
+                    SdkTracerProvider.builder(),
+                    ScopeConfigurator.<TracerConfig>builder()
+                        .setDefault(TracerConfig.disabled())
+                        .addCondition(
+                            ScopeConfiguratorBuilder.nameMatchesGlob("foo"), TracerConfig.enabled())
+                        .build())
+                .setSpanLimits(
+                    SpanLimits.builder()
+                        .setMaxNumberOfAttributes(1)
+                        .setMaxAttributeValueLength(2)
+                        .setMaxNumberOfEvents(3)
+                        .setMaxNumberOfLinks(4)
+                        .setMaxNumberOfAttributesPerEvent(5)
+                        .setMaxNumberOfAttributesPerLink(6)
+                        .build())
+                .setSampler(alwaysOn())
+                .addSpanProcessor(
+                    BatchSpanProcessor.builder(
+                            OtlpHttpSpanExporter.builder().setComponentLoader(context).build())
+                        .build())
+                .build()));
+  }
+
+  private static SdkTracerProviderBuilder addTracerConfigurator(
+      SdkTracerProviderBuilder builder, ScopeConfigurator<TracerConfig> tracerConfigurator) {
+    SdkTracerProviderUtil.setTracerConfigurator(builder, tracerConfigurator);
+    return builder;
+  }
+}

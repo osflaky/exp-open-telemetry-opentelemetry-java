@@ -1,0 +1,241 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.exporter.otlp.internal;
+
+import io.opentelemetry.api.metrics.MeterProvider;
+import io.opentelemetry.exporter.internal.FailedExportException;
+import io.opentelemetry.exporter.internal.marshal.Marshaler;
+import io.opentelemetry.exporter.internal.metrics.ExporterInstrumentation;
+import io.opentelemetry.sdk.common.CompletableResultCode;
+import io.opentelemetry.sdk.common.InternalTelemetryVersion;
+import io.opentelemetry.sdk.common.export.HttpResponse;
+import io.opentelemetry.sdk.common.export.HttpSender;
+import io.opentelemetry.sdk.common.export.MessageWriter;
+import io.opentelemetry.sdk.common.internal.StandardComponentId;
+import io.opentelemetry.sdk.common.internal.ThrottlingLogger;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.Nullable;
+
+/**
+ * An exporter for http/protobuf or http/json using a signal-specific Marshaler.
+ *
+ * <p>This class is internal and is hence not for public use. Its APIs are unstable and can change
+ * at any time.
+ */
+@SuppressWarnings("checkstyle:JavadocMethod")
+public final class HttpExporter {
+  // Limit logged response body text to avoid flooding warnings with large payloads.
+  private static final int MAX_RESPONSE_BODY_LOG_LENGTH = 1024;
+
+  private static final Logger internalLogger = Logger.getLogger(HttpExporter.class.getName());
+
+  private final ThrottlingLogger logger = new ThrottlingLogger(internalLogger);
+  private final AtomicBoolean isShutdown = new AtomicBoolean();
+
+  private final String type;
+  private final HttpSender httpSender;
+  private final ExporterInstrumentation exporterMetrics;
+  private final boolean exportAsJson;
+  private final long maxRequestBodySize;
+
+  public HttpExporter(
+      StandardComponentId componentId,
+      HttpSender httpSender,
+      Supplier<MeterProvider> meterProviderSupplier,
+      InternalTelemetryVersion internalTelemetryVersion,
+      URI endpoint,
+      boolean exportAsJson,
+      long maxRequestBodySize) {
+    this.type = componentId.getStandardType().signal().logFriendlyName();
+    this.httpSender = httpSender;
+    this.exporterMetrics =
+        new ExporterInstrumentation(
+            internalTelemetryVersion, meterProviderSupplier, componentId, endpoint);
+    this.exportAsJson = exportAsJson;
+    this.maxRequestBodySize = maxRequestBodySize;
+  }
+
+  public CompletableResultCode export(Marshaler exportRequest, int numItems) {
+    if (isShutdown.get()) {
+      return CompletableResultCode.ofFailure();
+    }
+
+    ExporterInstrumentation.Recording metricRecording =
+        exporterMetrics.startRecordingExport(numItems);
+
+    MessageWriter messageWriter =
+        exportAsJson ? exportRequest.toJsonMessageWriter() : exportRequest.toBinaryMessageWriter();
+
+    long requestBodySize;
+    try {
+      requestBodySize = getRequestBodySize(messageWriter);
+    } catch (IOException e) {
+      return failRequestBodySizeComputation(metricRecording, e);
+    }
+    if (requestBodySize > maxRequestBodySize) {
+      return failRequestTooLarge(metricRecording, requestBodySize);
+    }
+
+    CompletableResultCode result = new CompletableResultCode();
+
+    httpSender.send(
+        messageWriter,
+        httpResponse -> onResponse(result, metricRecording, httpResponse, numItems),
+        throwable -> onError(result, metricRecording, numItems, throwable));
+
+    return result;
+  }
+
+  private CompletableResultCode failRequestTooLarge(
+      ExporterInstrumentation.Recording metricRecording, long requestBodySize) {
+    String errorMessage =
+        "Failed to export "
+            + type
+            + "s. Request body size "
+            + requestBodySize
+            + " exceeded limit of "
+            + maxRequestBodySize
+            + " bytes";
+    IOException exception = new IOException(errorMessage);
+    metricRecording.finishFailed(exception);
+    logger.log(Level.WARNING, errorMessage);
+    return CompletableResultCode.ofExceptionalFailure(
+        FailedExportException.httpFailedExceptionally(exception));
+  }
+
+  private CompletableResultCode failRequestBodySizeComputation(
+      ExporterInstrumentation.Recording metricRecording, IOException exception) {
+    metricRecording.finishFailed(exception);
+    logger.log(
+        Level.SEVERE,
+        "Failed to export " + type + "s. The request body size could not be computed.",
+        exception);
+    return CompletableResultCode.ofExceptionalFailure(
+        FailedExportException.httpFailedExceptionally(exception));
+  }
+
+  private static long getRequestBodySize(MessageWriter messageWriter) throws IOException {
+    int contentLength = messageWriter.getContentLength();
+    if (contentLength >= 0) {
+      return contentLength;
+    }
+
+    CountingOutputStream countingOutputStream = new CountingOutputStream();
+    messageWriter.writeMessage(countingOutputStream);
+    return countingOutputStream.getCount();
+  }
+
+  private static final class CountingOutputStream extends OutputStream {
+    private long count;
+
+    @Override
+    public void write(int b) {
+      count++;
+    }
+
+    @Override
+    public void write(byte[] b, int off, int len) {
+      count += len;
+    }
+
+    private long getCount() {
+      return count;
+    }
+  }
+
+  private void onResponse(
+      CompletableResultCode result,
+      ExporterInstrumentation.Recording metricRecording,
+      HttpResponse httpResponse,
+      int numItems) {
+    int statusCode = httpResponse.getStatusCode();
+
+    metricRecording.setHttpStatusCode(statusCode);
+
+    if (statusCode >= 200 && statusCode < 300) {
+      metricRecording.finishSuccessful();
+      result.succeed();
+      return;
+    }
+
+    metricRecording.finishFailed(String.valueOf(statusCode));
+
+    byte[] body = httpResponse.getResponseBody();
+
+    String status = extractErrorStatus(httpResponse.getStatusMessage(), body);
+
+    logger.log(
+        levelOnFailure(Level.WARNING),
+        "Failed to export "
+            + numItems
+            + " "
+            + type
+            + "s. Server responded with HTTP status code "
+            + statusCode
+            + ". Error message: "
+            + status);
+
+    result.failExceptionally(FailedExportException.httpFailedWithResponse(httpResponse));
+  }
+
+  // Failures after shutdown are typically caused by in-flight requests being cancelled by
+  // shutdown() and are not actionable, so demote them to FINE.
+  private Level levelOnFailure(Level defaultLevel) {
+    return isShutdown.get() ? Level.FINE : defaultLevel;
+  }
+
+  private void onError(
+      CompletableResultCode result,
+      ExporterInstrumentation.Recording metricRecording,
+      int numItems,
+      Throwable e) {
+    metricRecording.finishFailed(e);
+    logger.log(
+        levelOnFailure(Level.SEVERE),
+        "Failed to export " + numItems + " " + type + "s. The request could not be executed.",
+        e);
+    result.failExceptionally(FailedExportException.httpFailedExceptionally(e));
+  }
+
+  public CompletableResultCode shutdown() {
+    if (!isShutdown.compareAndSet(false, true)) {
+      logger.log(Level.INFO, "Calling shutdown() multiple times.");
+      return CompletableResultCode.ofSuccess();
+    }
+    return httpSender.shutdown();
+  }
+
+  private static String extractErrorStatus(String statusMessage, @Nullable byte[] responseBody) {
+    if (responseBody == null) {
+      return "Response body missing, HTTP status message: " + statusMessage;
+    }
+    if (responseBody.length == 0) {
+      return "Response body has 0 length, HTTP status message: " + statusMessage;
+    }
+    try {
+      return GrpcExporterUtil.getStatusMessage(responseBody);
+    } catch (IOException e) {
+      return extractResponseBodyMessage(responseBody, statusMessage);
+    }
+  }
+
+  private static String extractResponseBodyMessage(byte[] responseBody, String statusMessage) {
+    int lengthToRead = Math.min(responseBody.length, MAX_RESPONSE_BODY_LOG_LENGTH);
+    String responseBodyText =
+        new String(responseBody, 0, lengthToRead, StandardCharsets.UTF_8).trim();
+    if (responseBodyText.isEmpty()) {
+      return "HTTP status message: " + statusMessage;
+    }
+    return "Response body: " + responseBodyText + ", HTTP status message: " + statusMessage;
+  }
+}

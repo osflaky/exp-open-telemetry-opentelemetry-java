@@ -1,0 +1,107 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.sdk.metrics.internal.view;
+
+import io.opentelemetry.sdk.common.Clock;
+import io.opentelemetry.sdk.common.export.MemoryMode;
+import io.opentelemetry.sdk.common.internal.RandomSupplier;
+import io.opentelemetry.sdk.metrics.Aggregation;
+import io.opentelemetry.sdk.metrics.data.MetricDataType;
+import io.opentelemetry.sdk.metrics.data.PointData;
+import io.opentelemetry.sdk.metrics.internal.aggregator.Aggregator;
+import io.opentelemetry.sdk.metrics.internal.aggregator.AggregatorFactory;
+import io.opentelemetry.sdk.metrics.internal.aggregator.DoubleBase2ExponentialHistogramAggregator;
+import io.opentelemetry.sdk.metrics.internal.descriptor.InstrumentDescriptor;
+import io.opentelemetry.sdk.metrics.internal.exemplar.ExemplarFilterInternal;
+import io.opentelemetry.sdk.metrics.internal.exemplar.ExemplarReservoirFactory;
+
+/**
+ * Exponential bucket histogram aggregation configuration.
+ *
+ * <p>This class is internal and is hence not for public use. Its APIs are unstable and can change
+ * at any time.
+ */
+public final class Base2ExponentialHistogramAggregation implements Aggregation, AggregatorFactory {
+
+  private static final int DEFAULT_MAX_BUCKETS = 160;
+  private static final int DEFAULT_MAX_SCALE = 20;
+
+  private static final Aggregation DEFAULT =
+      new Base2ExponentialHistogramAggregation(
+          DEFAULT_MAX_BUCKETS, DEFAULT_MAX_SCALE, /* recordMinMax= */ true);
+
+  private final int maxBuckets;
+  private final int maxScale;
+  private final boolean recordMinMax;
+
+  private Base2ExponentialHistogramAggregation(int maxBuckets, int maxScale, boolean recordMinMax) {
+    this.maxBuckets = maxBuckets;
+    this.maxScale = maxScale;
+    this.recordMinMax = recordMinMax;
+  }
+
+  public static Aggregation getDefault() {
+    return DEFAULT;
+  }
+
+  /**
+   * Aggregations measurements into an {@link MetricDataType#EXPONENTIAL_HISTOGRAM}.
+   *
+   * @param maxBuckets the max number of positive buckets and negative buckets (max total buckets is
+   *     2 * {@code maxBuckets} + 1 zero bucket).
+   * @param maxScale the maximum and initial scale. If measurements can't fit in a particular scale
+   *     given the {@code maxBuckets}, the scale is reduced until the measurements can be
+   *     accommodated. Setting maxScale may reduce the number of downscales. Additionally, the
+   *     performance of computing bucket index is improved when scale is <= 0.
+   * @param recordMinMax whether to record min and max values
+   * @return the aggregation
+   */
+  public static Aggregation create(int maxBuckets, int maxScale, boolean recordMinMax) {
+    return new Base2ExponentialHistogramAggregation(maxBuckets, maxScale, recordMinMax);
+  }
+
+  @Override
+  @SuppressWarnings("unchecked")
+  public <T extends PointData> Aggregator<T> createAggregator(
+      InstrumentDescriptor instrumentDescriptor,
+      ExemplarFilterInternal exemplarFilter,
+      MemoryMode memoryMode) {
+    return (Aggregator<T>)
+        new DoubleBase2ExponentialHistogramAggregator(
+            ExemplarReservoirFactory.filtered(
+                exemplarFilter,
+                ExemplarReservoirFactory.fixedSizeReservoir(
+                    Clock.getDefault(),
+                    Runtime.getRuntime().availableProcessors(),
+                    RandomSupplier.platformDefault())),
+            maxBuckets,
+            maxScale,
+            recordMinMax,
+            memoryMode);
+  }
+
+  @Override
+  public boolean isCompatibleWithInstrument(InstrumentDescriptor instrumentDescriptor) {
+    switch (instrumentDescriptor.getType()) {
+      case COUNTER:
+      case HISTOGRAM:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  @Override
+  public String toString() {
+    return "Base2ExponentialHistogramAggregation{maxBuckets="
+        + maxBuckets
+        + ",maxScale="
+        + maxScale
+        + ",recordMinMax="
+        + recordMinMax
+        + "}";
+  }
+}

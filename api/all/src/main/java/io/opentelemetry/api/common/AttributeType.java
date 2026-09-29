@@ -1,0 +1,27 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.api.common;
+
+/**
+ * An enum that represents all the possible value types for an {@code AttributeKey} and hence the
+ * types of values that are allowed for {@link Attributes}.
+ */
+public enum AttributeType {
+  STRING,
+  BOOLEAN,
+  LONG,
+  DOUBLE,
+  STRING_ARRAY,
+  BOOLEAN_ARRAY,
+  LONG_ARRAY,
+  DOUBLE_ARRAY,
+  /**
+   * {@link Value}-based attributes.
+   *
+   * @since 1.59.0
+   */
+  VALUE
+}

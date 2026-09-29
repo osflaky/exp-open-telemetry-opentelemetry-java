@@ -1,0 +1,134 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.sdk.autoconfigure.declarativeconfig;
+
+import static io.opentelemetry.sdk.testing.assertj.OpenTelemetryAssertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import io.opentelemetry.api.incubator.config.DeclarativeConfigException;
+import io.opentelemetry.common.ComponentLoader;
+import io.opentelemetry.exporter.otlp.http.trace.OtlpHttpSpanExporter;
+import io.opentelemetry.internal.testing.CleanupExtension;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.component.SpanProcessorComponentProvider;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.BatchSpanProcessorModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.OtlpHttpExporterModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.SimpleSpanProcessorModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.SpanExporterModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.SpanProcessorModel;
+import io.opentelemetry.sdk.trace.SpanProcessor;
+import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+class SpanProcessorFactoryTest {
+
+  @RegisterExtension CleanupExtension cleanup = new CleanupExtension();
+
+  private static final DeclarativeConfigContext context =
+      new DeclarativeConfigContext(
+          ComponentLoader.forClassLoader(SpanProcessorFactoryTest.class.getClassLoader()));
+
+  @BeforeEach
+  void setup() {
+    context.setBuilder(new DeclarativeConfigurationBuilder());
+  }
+
+  @ParameterizedTest
+  @MethodSource("createTestCases")
+  void create(SpanProcessorModel model, SpanProcessor expectedProcessor) {
+    cleanup.addCloseable(expectedProcessor);
+    SpanProcessor processor = SpanProcessorFactory.getInstance().create(model, context);
+    cleanup.addCloseable(processor);
+    assertThat(processor.toString()).isEqualTo(expectedProcessor.toString());
+  }
+
+  private static Stream<Arguments> createTestCases() {
+    return Stream.of(
+        Arguments.argumentSet(
+            "batch default",
+            new SpanProcessorModel()
+                .setBatch(
+                    new BatchSpanProcessorModel()
+                        .setExporter(
+                            new SpanExporterModel().setOtlpHttp(new OtlpHttpExporterModel()))),
+            BatchSpanProcessor.builder(
+                    OtlpHttpSpanExporter.builder().setComponentLoader(context).build())
+                .build()),
+        Arguments.argumentSet(
+            "batch with options",
+            new SpanProcessorModel()
+                .setBatch(
+                    new BatchSpanProcessorModel()
+                        .setExporter(
+                            new SpanExporterModel().setOtlpHttp(new OtlpHttpExporterModel()))
+                        .setScheduleDelay(1)
+                        .setMaxExportBatchSize(2)
+                        .setExportTimeout(3)),
+            BatchSpanProcessor.builder(
+                    OtlpHttpSpanExporter.builder().setComponentLoader(context).build())
+                .setScheduleDelay(Duration.ofMillis(1))
+                .setMaxExportBatchSize(2)
+                .setExporterTimeout(Duration.ofMillis(3))
+                .build()),
+        Arguments.argumentSet(
+            "simple",
+            new SpanProcessorModel()
+                .setSimple(
+                    new SimpleSpanProcessorModel()
+                        .setExporter(
+                            new SpanExporterModel().setOtlpHttp(new OtlpHttpExporterModel()))),
+            SimpleSpanProcessor.create(
+                OtlpHttpSpanExporter.builder().setComponentLoader(context).build())));
+  }
+
+  @ParameterizedTest
+  @MethodSource("createInvalidTestCases")
+  void create_Invalid(SpanProcessorModel model, String expectedMessage) {
+    assertThatThrownBy(() -> SpanProcessorFactory.getInstance().create(model, context))
+        .isInstanceOf(DeclarativeConfigException.class)
+        .hasMessage(expectedMessage);
+  }
+
+  private static Stream<Arguments> createInvalidTestCases() {
+    return Stream.of(
+        Arguments.argumentSet(
+            "batch missing exporter",
+            new SpanProcessorModel().setBatch(new BatchSpanProcessorModel()),
+            "batch span processor exporter is required but is null"),
+        Arguments.argumentSet(
+            "simple missing exporter",
+            new SpanProcessorModel().setSimple(new SimpleSpanProcessorModel()),
+            "simple span processor exporter is required but is null"),
+        Arguments.argumentSet(
+            "unknown component provider",
+            new SpanProcessorModel()
+                .setExtensionProperty("unknown_key", Collections.singletonMap("key1", "value1")),
+            "No component provider detected for io.opentelemetry.sdk.trace.SpanProcessor with name \"unknown_key\"."));
+  }
+
+  @Test
+  void create_SpiProcessor_Valid() {
+    SpanProcessor spanProcessor =
+        SpanProcessorFactory.getInstance()
+            .create(
+                new SpanProcessorModel()
+                    .setExtensionProperty("test", Collections.singletonMap("key1", "value1")),
+                context);
+    assertThat(spanProcessor).isInstanceOf(SpanProcessorComponentProvider.TestSpanProcessor.class);
+    assertThat(
+            ((SpanProcessorComponentProvider.TestSpanProcessor) spanProcessor)
+                .config.getString("key1"))
+        .isEqualTo("value1");
+  }
+}

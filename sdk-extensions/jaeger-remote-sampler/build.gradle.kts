@@ -1,0 +1,105 @@
+plugins {
+  id("otel.protobuf-conventions")
+  id("otel.publish-conventions")
+
+  id("otel.animalsniffer-conventions")
+
+  id("com.squareup.wire")
+}
+
+description = "OpenTelemetry - Jaeger Remote sampler"
+otelJava.moduleName.set("io.opentelemetry.sdk.extension.trace.jaeger")
+otelJava.requireSuppressWarningsExplanation.set(false)
+otelJava.osgiOptionalPackages.set(listOf("io.opentelemetry.sdk.autoconfigure.declarativeconfig", "io.opentelemetry.sdk.autoconfigure.spi"))
+otelJava.osgiServiceLoaderProvides.set(listOf(
+  "io.opentelemetry.sdk.autoconfigure.spi.traces.ConfigurableSamplerProvider",
+  "io.opentelemetry.sdk.autoconfigure.spi.internal.ComponentProvider",
+))
+
+dependencies {
+  api(project(":sdk:all"))
+  compileOnly(project(":api:incubator"))
+  compileOnly(project(":sdk-extensions:autoconfigure"))
+  compileOnly(project(":sdk-extensions:declarative-config"))
+
+  implementation(project(":sdk:all"))
+  implementation(project(":exporters:common"))
+  implementation(project(":exporters:sender:okhttp"))
+
+  annotationProcessor("com.google.auto.value:auto-value")
+
+  compileOnly("io.grpc:grpc-api")
+  compileOnly("io.grpc:grpc-protobuf")
+  compileOnly("io.grpc:grpc-stub")
+
+  testImplementation(project(":sdk:testing"))
+  testImplementation(project(":sdk-extensions:autoconfigure"))
+  testImplementation("com.google.guava:guava")
+  testImplementation("com.google.protobuf:protobuf-java")
+  testImplementation("com.linecorp.armeria:armeria-junit5")
+  testImplementation("com.linecorp.armeria:armeria-grpc")
+  testImplementation("com.linecorp.armeria:armeria-grpc-protocol")
+  testImplementation("org.testcontainers:testcontainers-junit-jupiter")
+}
+
+testing {
+  suites {
+    register<JvmTestSuite>("testGrpcNetty") {
+      dependencies {
+        implementation(project(":sdk:testing"))
+        implementation(project(":exporters:common"))
+        implementation(project(":exporters:sender:grpc-managed-channel"))
+        implementation("com.google.protobuf:protobuf-java")
+        implementation("com.linecorp.armeria:armeria-junit5")
+        implementation("com.linecorp.armeria:armeria-grpc-protocol")
+        implementation("org.testcontainers:testcontainers-junit-jupiter")
+        implementation("io.grpc:grpc-netty")
+        implementation("io.grpc:grpc-stub")
+      }
+      targets {
+        all {
+          testTask {
+            systemProperty(
+              "io.opentelemetry.sdk.common.export.GrpcSenderProvider",
+              "io.opentelemetry.exporter.sender.grpc.managedchannel.internal.UpstreamGrpcSenderProvider"
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+afterEvaluate {
+  // Classpath when compiling testGrpcNetty, we add dependency management directly
+  // since it doesn't follow Gradle conventions of naming / properties.
+  dependencies {
+    add("testGrpcNettyCompileProtoPath", platform(project(":dependencyManagement")))
+  }
+}
+
+tasks {
+  check {
+    dependsOn(testing.suites)
+  }
+}
+
+wire {
+  custom {
+    schemaHandlerFactoryClass = "io.opentelemetry.gradle.ProtoFieldsWireHandlerFactory"
+  }
+}
+
+tasks {
+  compileJava {
+    with(options) {
+      // Generated code so can't control serialization.
+      compilerArgs.add("-Xlint:-serial")
+    }
+  }
+
+  checkstyleMain {
+    // overrides the default which includes generated proto sources
+    source = fileTree("src/main/java")
+  }
+}

@@ -1,0 +1,120 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.sdk.autoconfigure.declarativeconfig;
+
+import io.opentelemetry.api.incubator.config.DeclarativeConfigException;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.AlwaysRecordSamplerModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.ParentBasedSamplerModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.SamplerModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.TraceIdRatioBasedSamplerModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.internal.ExperimentalComposableSamplerModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.internal.ExperimentalProbabilitySamplerModel;
+import io.opentelemetry.sdk.autoconfigure.declarativeconfig.model.internal.SamplerModelAccessor;
+import io.opentelemetry.sdk.extension.incubator.trace.samplers.AlwaysRecordSampler;
+import io.opentelemetry.sdk.extension.incubator.trace.samplers.ComposableSampler;
+import io.opentelemetry.sdk.extension.incubator.trace.samplers.CompositeSampler;
+import io.opentelemetry.sdk.trace.samplers.ParentBasedSamplerBuilder;
+import io.opentelemetry.sdk.trace.samplers.Sampler;
+
+final class SamplerFactory implements Factory<SamplerModel, Sampler> {
+
+  private static final SamplerFactory INSTANCE = new SamplerFactory();
+
+  private SamplerFactory() {}
+
+  static SamplerFactory getInstance() {
+    return INSTANCE;
+  }
+
+  @Override
+  public Sampler create(SamplerModel model, DeclarativeConfigContext context) {
+    // We don't use the variable till later but call validate first to confirm there are not
+    // multiple samplers.
+    ConfigKeyValue samplerKeyValue =
+        FileConfigUtil.validateSingleKeyValue(context, model, "sampler");
+
+    if (model.getAlwaysOn() != null) {
+      return Sampler.alwaysOn();
+    }
+    if (model.getAlwaysOff() != null) {
+      return Sampler.alwaysOff();
+    }
+    if (model.getTraceIdRatioBased() != null) {
+      return createTraceIdRatioBasedSampler(model.getTraceIdRatioBased());
+    }
+    if (model.getParentBased() != null) {
+      return createParedBasedSampler(model.getParentBased(), context);
+    }
+    if (model.getAlwaysRecord() != null) {
+      return createAlwaysRecordSampler(model.getAlwaysRecord(), context);
+    }
+    ExperimentalProbabilitySamplerModel probabilityDevelopment =
+        SamplerModelAccessor.getProbability(model);
+    if (probabilityDevelopment != null) {
+      return createProbabilitySampler(probabilityDevelopment);
+    }
+    ExperimentalComposableSamplerModel compositeDevelopment =
+        SamplerModelAccessor.getComposite(model);
+    if (compositeDevelopment != null) {
+      return CompositeSampler.wrap(
+          ComposableSamplerFactory.getInstance().create(compositeDevelopment, context));
+    }
+
+    return context.loadComponent(Sampler.class, samplerKeyValue);
+  }
+
+  private static Sampler createTraceIdRatioBasedSampler(TraceIdRatioBasedSamplerModel model) {
+    Double ratio = model.getRatio();
+    if (ratio == null) {
+      ratio = 1.0d;
+    }
+    return Sampler.traceIdRatioBased(ratio);
+  }
+
+  private static Sampler createParedBasedSampler(
+      ParentBasedSamplerModel parentBasedModel, DeclarativeConfigContext context) {
+    Sampler root =
+        parentBasedModel.getRoot() == null
+            ? Sampler.alwaysOn()
+            : INSTANCE.create(parentBasedModel.getRoot(), context);
+    ParentBasedSamplerBuilder builder = Sampler.parentBasedBuilder(root);
+    if (parentBasedModel.getRemoteParentSampled() != null) {
+      Sampler sampler = INSTANCE.create(parentBasedModel.getRemoteParentSampled(), context);
+      builder.setRemoteParentSampled(sampler);
+    }
+    if (parentBasedModel.getRemoteParentNotSampled() != null) {
+      Sampler sampler = INSTANCE.create(parentBasedModel.getRemoteParentNotSampled(), context);
+      builder.setRemoteParentNotSampled(sampler);
+    }
+    if (parentBasedModel.getLocalParentSampled() != null) {
+      Sampler sampler = INSTANCE.create(parentBasedModel.getLocalParentSampled(), context);
+      builder.setLocalParentSampled(sampler);
+    }
+    if (parentBasedModel.getLocalParentNotSampled() != null) {
+      Sampler sampler = INSTANCE.create(parentBasedModel.getLocalParentNotSampled(), context);
+      builder.setLocalParentNotSampled(sampler);
+    }
+    return builder.build();
+  }
+
+  private static Sampler createAlwaysRecordSampler(
+      AlwaysRecordSamplerModel alwaysRecordModel, DeclarativeConfigContext context) {
+    SamplerModel rootModel = alwaysRecordModel.getRoot();
+    if (rootModel == null) {
+      throw new DeclarativeConfigException("always_record sampler .root is required");
+    }
+    return AlwaysRecordSampler.create(INSTANCE.create(rootModel, context));
+  }
+
+  private static Sampler createProbabilitySampler(
+      ExperimentalProbabilitySamplerModel probabilityModel) {
+    Double ratio = probabilityModel.getRatio();
+    if (ratio == null) {
+      ratio = 1.0d;
+    }
+    return CompositeSampler.wrap(ComposableSampler.probability(ratio));
+  }
+}

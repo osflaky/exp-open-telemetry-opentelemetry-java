@@ -1,0 +1,95 @@
+plugins {
+  id("me.champeau.jmh")
+  id("io.morethan.jmhreport")
+}
+
+dependencies {
+  jmh(platform(project(":dependencyManagement")))
+  jmh("org.openjdk.jmh:jmh-core")
+  jmh("org.openjdk.jmh:jmh-generator-bytecode")
+
+  // This enables running JMH benchmark classes within IntelliJ using
+  // JMH plugins
+  jmh("org.openjdk.jmh:jmh-generator-annprocess")
+  jmhAnnotationProcessor("org.openjdk.jmh:jmh-generator-annprocess")
+}
+
+// invoke jmh on a single benchmark class like so:
+//   ./gradlew -PjmhIncludeSingleClass=StatsTraceContextBenchmark clean :grpc-core:jmh
+jmh {
+  failOnError.set(true)
+  resultFormat.set("JSON")
+  // Otherwise an error will happen:
+  // Could not expand ZIP 'byte-buddy-agent-1.9.7.jar'.
+  includeTests.set(false)
+  profilers.add("gc")
+  val jmhIncludeSingleClass = project.findProperty("jmhIncludeSingleClass") as String?
+  if (jmhIncludeSingleClass != null) {
+    includes.add(jmhIncludeSingleClass)
+  }
+
+  val jmhFork = project.findProperty("jmhFork") as String?
+  if (jmhFork != null) {
+    fork.set(jmhFork.toInt())
+  }
+
+  val jmhIterations = project.findProperty("jmhIterations") as String?
+  if (jmhIterations != null) {
+    iterations.set(jmhIterations.toInt())
+  }
+
+  val jmhTime = project.findProperty("jmhTime") as String?
+  if (jmhTime != null) {
+    timeOnIteration.set(jmhTime)
+  }
+
+  val jmhWarmupIterations = project.findProperty("jmhWarmupIterations") as String?
+  if (jmhWarmupIterations != null) {
+    warmupIterations.set(jmhWarmupIterations.toInt())
+  }
+
+  val jmhWarmup = project.findProperty("jmhWarmup") as String?
+  if (jmhWarmup != null) {
+    warmup.set(jmhWarmup)
+  }
+
+  val testJavaVersion = gradle.startParameter.projectProperties.get("testJavaVersion")?.let(JavaVersion::toVersion)
+  if (testJavaVersion != null) {
+    val javaExecutable = javaToolchains.launcherFor {
+      languageVersion.set(JavaLanguageVersion.of(testJavaVersion.majorVersion))
+    }.get().executablePath.asFile.absolutePath
+
+    jvm.set(javaExecutable)
+  }
+}
+
+val jmhResultsDir = project.findProperty("jmhResultsDir") as String?
+if (jmhResultsDir != null) {
+  val jmhLabel = (project.findProperty("jmhLabel") as String?)
+    ?: project.path.trimStart(':').replace(':', '-').ifEmpty { project.name }
+
+  val jmhCopyResults = tasks.register<Copy>("jmhCopyResults") {
+    description = "Copies JMH JSON results to jmhResultsDir for cross-run comparison."
+    from(layout.buildDirectory.file("results/jmh/results.json"))
+    into(rootProject.file(jmhResultsDir))
+    rename { "${jmhLabel}.json" }
+  }
+
+  tasks.named("jmh") {
+    finalizedBy(jmhCopyResults)
+  }
+}
+
+jmhReport {
+  val buildDirectory = layout.buildDirectory.asFile.get()
+  jmhResultPath = file("$buildDirectory/results/jmh/results.json").absolutePath
+  jmhReportOutput = file("$buildDirectory/results/jmh").absolutePath
+}
+
+tasks {
+  named("jmh") {
+    finalizedBy(named("jmhReport"))
+
+    outputs.cacheIf { false }
+  }
+}

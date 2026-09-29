@@ -1,0 +1,494 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.exporter.sender.jdk.internal;
+
+import io.opentelemetry.api.impl.InstrumentationUtil;
+import io.opentelemetry.exporter.internal.RetryUtil;
+import io.opentelemetry.sdk.common.CompletableResultCode;
+import io.opentelemetry.sdk.common.export.Compressor;
+import io.opentelemetry.sdk.common.export.HttpResponse;
+import io.opentelemetry.sdk.common.export.HttpSender;
+import io.opentelemetry.sdk.common.export.MessageWriter;
+import io.opentelemetry.sdk.common.export.ProxyOptions;
+import io.opentelemetry.sdk.common.export.RetryPolicy;
+import io.opentelemetry.sdk.common.internal.DaemonThreadFactory;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse.BodyHandlers;
+import java.nio.ByteBuffer;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.zip.GZIPInputStream;
+import javax.annotation.Nullable;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLParameters;
+
+/**
+ * {@link HttpSender} which is backed by JDK {@link HttpClient}.
+ *
+ * <p>This class is internal and is hence not for public use. Its APIs are unstable and can change
+ * at any time.
+ */
+public final class JdkHttpSender implements HttpSender {
+
+  private static final Set<Integer> retryableStatusCodes = RetryUtil.retryableHttpResponseCodes();
+
+  private static final ThreadLocal<NoCopyByteArrayOutputStream> threadLocalBaos =
+      ThreadLocal.withInitial(NoCopyByteArrayOutputStream::new);
+  private static final ThreadLocal<ByteBufferPool> threadLocalByteBufPool =
+      ThreadLocal.withInitial(ByteBufferPool::new);
+
+  private static final Logger logger = Logger.getLogger(JdkHttpSender.class.getName());
+
+  private final boolean managedExecutor;
+  private final ExecutorService executorService;
+  private final HttpClient client;
+  private final URI endpoint;
+  private final String contentType;
+  @Nullable private final Compressor compressor;
+  private final Duration timeout;
+  private final Supplier<Map<String, List<String>>> headerSupplier;
+  @Nullable private final RetryPolicy retryPolicy;
+  private final Predicate<IOException> retryExceptionPredicate;
+  private final long maxResponseBodySize;
+
+  // Visible for testing
+  JdkHttpSender(
+      HttpClient client,
+      URI endpoint,
+      String contentType,
+      @Nullable Compressor compressor,
+      Duration timeout,
+      Supplier<Map<String, List<String>>> headerSupplier,
+      @Nullable RetryPolicy retryPolicy,
+      @Nullable ExecutorService executorService,
+      long maxResponseBodySize) {
+    this.client = client;
+    this.endpoint = endpoint;
+    this.contentType = contentType;
+    this.compressor = compressor;
+    this.timeout = timeout;
+    this.headerSupplier = headerSupplier;
+    this.retryPolicy = retryPolicy;
+    this.retryExceptionPredicate =
+        Optional.ofNullable(retryPolicy)
+            .map(RetryPolicy::getRetryExceptionPredicate)
+            .orElse(JdkHttpSender::isRetryableException);
+    if (executorService == null) {
+      this.executorService = newExecutor();
+      this.managedExecutor = true;
+    } else {
+      this.executorService = executorService;
+      this.managedExecutor = false;
+    }
+    this.maxResponseBodySize = maxResponseBodySize;
+  }
+
+  JdkHttpSender(
+      URI endpoint,
+      String contentType,
+      @Nullable Compressor compressor,
+      Duration timeout,
+      Duration connectTimeout,
+      Supplier<Map<String, List<String>>> headerSupplier,
+      @Nullable RetryPolicy retryPolicy,
+      @Nullable ProxyOptions proxyOptions,
+      @Nullable SSLContext sslContext,
+      @Nullable ExecutorService executorService,
+      long maxResponseBodySize,
+      @Nullable List<String> enabledProtocols) {
+    this(
+        configureClient(sslContext, connectTimeout, proxyOptions, enabledProtocols),
+        endpoint,
+        contentType,
+        compressor,
+        timeout,
+        headerSupplier,
+        retryPolicy,
+        executorService,
+        maxResponseBodySize);
+  }
+
+  private static ExecutorService newExecutor() {
+    return new ThreadPoolExecutor(
+        0,
+        Math.max(Runtime.getRuntime().availableProcessors(), 5),
+        60,
+        TimeUnit.SECONDS,
+        new SynchronousQueue<>(),
+        new DaemonThreadFactory("jdkhttp-executor"));
+  }
+
+  private static HttpClient configureClient(
+      @Nullable SSLContext sslContext,
+      Duration connectTimeout,
+      @Nullable ProxyOptions proxyOptions,
+      @Nullable List<String> enabledProtocols) {
+    HttpClient.Builder builder = HttpClient.newBuilder().connectTimeout(connectTimeout);
+    if (sslContext != null) {
+      builder.sslContext(sslContext);
+    }
+    if (proxyOptions != null) {
+      builder.proxy(proxyOptions.getProxySelector());
+    }
+    if (enabledProtocols != null && !enabledProtocols.isEmpty()) {
+      SSLParameters params = new SSLParameters();
+      params.setProtocols(enabledProtocols.toArray(new String[0]));
+      builder.sslParameters(params);
+    }
+    return builder.build();
+  }
+
+  @Override
+  public void send(
+      MessageWriter messageWriter, Consumer<HttpResponse> onResponse, Consumer<Throwable> onError) {
+    try {
+      InstrumentationUtil.suppressInstrumentation(
+          () -> {
+            CompletableFuture<HttpResponse> unused =
+                CompletableFuture.supplyAsync(
+                        () -> {
+                          try {
+                            return sendInternal(messageWriter);
+                          } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                          }
+                        },
+                        executorService)
+                    .whenComplete(
+                        (httpResponse, throwable) -> {
+                          if (throwable != null) {
+                            onError.accept(throwable);
+                            return;
+                          }
+                          onResponse.accept(httpResponse);
+                        });
+          });
+    } catch (RejectedExecutionException e) {
+      onError.accept(e);
+    }
+  }
+
+  // Visible for testing
+  HttpResponse sendInternal(MessageWriter requestBodyWriter) throws IOException {
+    long startTimeNanos = System.nanoTime();
+    HttpRequest.Builder requestBuilder = HttpRequest.newBuilder().uri(endpoint).timeout(timeout);
+    Map<String, List<String>> headers = headerSupplier.get();
+    if (headers != null) {
+      headers.forEach((key, values) -> values.forEach(value -> requestBuilder.header(key, value)));
+    }
+    requestBuilder.header("Content-Type", contentType);
+    // Advertise gzip and identity response encoding support.
+    requestBuilder.header("Accept-Encoding", "gzip, identity");
+
+    NoCopyByteArrayOutputStream os = threadLocalBaos.get();
+    os.reset();
+    if (compressor != null) {
+      requestBuilder.header("Content-Encoding", compressor.getEncoding());
+      try (OutputStream compressed = compressor.compress(os)) {
+        requestBodyWriter.writeMessage(compressed);
+      } catch (IOException e) {
+        throw new IllegalStateException(e);
+      }
+    } else {
+      requestBodyWriter.writeMessage(os);
+    }
+
+    ByteBufferPool byteBufferPool = threadLocalByteBufPool.get();
+    requestBuilder.POST(new BodyPublisher(os.buf(), os.size(), byteBufferPool::getBuffer));
+
+    // If no retry policy, short circuit
+    if (retryPolicy == null) {
+      return toHttpResponse(sendRequest(requestBuilder, byteBufferPool));
+    }
+
+    long attempt = 0;
+    long nextBackoffNanos = retryPolicy.getInitialBackoff().toNanos();
+    HttpResponse httpResponse = null;
+    IOException exception = null;
+    OptionalLong retryDelayNanos = OptionalLong.empty();
+    do {
+      if (attempt > 0) {
+        long remainingNanos = timeout.toNanos() - (System.nanoTime() - startTimeNanos);
+        if (remainingNanos <= 0) {
+          break;
+        }
+        // Compute and sleep for backoff
+        long currentBackoffNanos =
+            Math.min(nextBackoffNanos, retryPolicy.getMaxBackoff().toNanos());
+        long requestedBackoffNanos =
+            retryDelayNanos.isPresent()
+                ? retryDelayNanos.getAsLong()
+                : (long) (ThreadLocalRandom.current().nextDouble(0.8d, 1.2d) * currentBackoffNanos);
+        long backoffNanos = Math.min(requestedBackoffNanos, remainingNanos);
+        nextBackoffNanos = (long) (currentBackoffNanos * retryPolicy.getBackoffMultiplier());
+        retryDelayNanos = OptionalLong.empty();
+        try {
+          TimeUnit.NANOSECONDS.sleep(backoffNanos);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          break; // Break out and return response or throw
+        }
+        // If after sleeping we've exceeded timeoutNanos, break out and return
+        // response or throw
+        if ((System.nanoTime() - startTimeNanos) >= timeout.toNanos()) {
+          break;
+        }
+      }
+      httpResponse = null;
+      exception = null;
+      requestBuilder.timeout(timeout.minusNanos(System.nanoTime() - startTimeNanos));
+      try {
+        java.net.http.HttpResponse<InputStream> rawResponse =
+            sendRequest(requestBuilder, byteBufferPool);
+        httpResponse = toHttpResponse(rawResponse);
+        boolean retryable = retryableStatusCodes.contains(rawResponse.statusCode());
+        if (logger.isLoggable(Level.FINER)) {
+          logger.log(
+              Level.FINER,
+              "Attempt "
+                  + attempt
+                  + " returned "
+                  + (retryable ? "retryable" : "non-retryable")
+                  + " response: "
+                  + responseStringRepresentation(httpResponse));
+        }
+        if (!retryable) {
+          return httpResponse;
+        }
+        retryDelayNanos = retryDelayNanos(rawResponse);
+      } catch (IOException e) {
+        exception = e;
+        boolean retryable = retryExceptionPredicate.test(exception);
+        if (logger.isLoggable(Level.FINER)) {
+          logger.log(
+              Level.FINER,
+              "Attempt "
+                  + attempt
+                  + " failed with "
+                  + (retryable ? "retryable" : "non-retryable")
+                  + " exception",
+              exception);
+        }
+        if (!retryable) {
+          throw exception;
+        }
+      }
+    } while (++attempt < retryPolicy.getMaxAttempts());
+
+    if (httpResponse != null) {
+      return httpResponse;
+    }
+    throw exception;
+  }
+
+  private static String responseStringRepresentation(HttpResponse response) {
+    return "HttpResponse{code=" + response.getStatusCode() + "}";
+  }
+
+  private java.net.http.HttpResponse<InputStream> sendRequest(
+      HttpRequest.Builder requestBuilder, ByteBufferPool byteBufferPool) throws IOException {
+    try {
+      return client.send(requestBuilder.build(), BodyHandlers.ofInputStream());
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException(e);
+    } finally {
+      byteBufferPool.resetPool();
+    }
+  }
+
+  private static boolean isRetryableException(IOException throwable) {
+    // Almost all IOExceptions we've encountered are transient retryable, so we
+    // opt out of specific
+    // IOExceptions that are unlikely to resolve rather than opting in.
+    // Known retryable IOException messages: "Connection reset", "/{remote
+    // ip}:{remote port} GOAWAY
+    // received"
+    // Known retryable HttpTimeoutException messages: "request timed out"
+    // Known retryable HttpConnectTimeoutException messages: "HTTP connect timed
+    // out"
+    // ResponseBodyTooLargeException and UnsupportedContentEncodingException are permanent errors:
+    // a larger body or unsupported encoding will not resolve on retry.
+    return !(throwable instanceof SSLException)
+        && !(throwable instanceof ResponseBodyTooLargeException)
+        && !(throwable instanceof UnsupportedContentEncodingException);
+  }
+
+  private static final class ResponseBodyTooLargeException extends IOException {
+    ResponseBodyTooLargeException(String message) {
+      super(message);
+    }
+  }
+
+  private static final class UnsupportedContentEncodingException extends IOException {
+    UnsupportedContentEncodingException(String message) {
+      super(message);
+    }
+  }
+
+  private static class NoCopyByteArrayOutputStream extends ByteArrayOutputStream {
+    NoCopyByteArrayOutputStream() {
+      super(retryableStatusCodes.size());
+    }
+
+    private byte[] buf() {
+      return buf;
+    }
+  }
+
+  private HttpResponse toHttpResponse(java.net.http.HttpResponse<InputStream> response)
+      throws IOException {
+    int statusCode = response.statusCode();
+    // Read up to maxResponseBodySize + 1 bytes. Reading exactly one byte more than the limit
+    // lets us detect overflow: if we read more than maxResponseBodySize bytes, the body exceeded
+    // the limit. A body exactly at the limit will read no further (EOF is reached first).
+    // If maxResponseBodySize is >= Integer.MAX_VALUE, adding 1 would overflow (long) or exceed
+    // what an int can hold. In that case use Integer.MAX_VALUE — the overflow check can never
+    // trigger for such a large limit.
+    int readUpTo =
+        maxResponseBodySize >= Integer.MAX_VALUE
+            ? Integer.MAX_VALUE
+            : (int) (maxResponseBodySize + 1);
+
+    String contentEncoding = response.headers().firstValue("Content-Encoding").orElse(null);
+    if (contentEncoding != null
+        && !"gzip".equalsIgnoreCase(contentEncoding)
+        && !"identity".equalsIgnoreCase(contentEncoding)) {
+      throw new UnsupportedContentEncodingException(
+          "Unsupported Content-Encoding: " + contentEncoding);
+    }
+    boolean decompress = "gzip".equalsIgnoreCase(contentEncoding);
+
+    byte[] bodyBytes;
+    try (InputStream rawIs = response.body()) {
+      // The limit is applied to the decompressed bytes.
+      InputStream is = decompress ? new GZIPInputStream(rawIs) : rawIs;
+      ByteArrayOutputStream baos = new ByteArrayOutputStream();
+      byte[] buf = new byte[4 * 0x400]; // 4KB
+      int n;
+      while (baos.size() < readUpTo
+          && (n = is.read(buf, 0, Math.min(buf.length, readUpTo - baos.size()))) != -1) {
+        baos.write(buf, 0, n);
+      }
+      bodyBytes = baos.toByteArray();
+    } catch (IOException e) {
+      bodyBytes = new byte[0];
+      logger.log(Level.WARNING, "Failed to read response body", e);
+    }
+    if (bodyBytes.length > maxResponseBodySize) {
+      throw new ResponseBodyTooLargeException(
+          "HTTP response body exceeded limit of " + maxResponseBodySize + " bytes");
+    }
+    return ImmutableHttpResponse.create(statusCode, String.valueOf(statusCode), bodyBytes);
+  }
+
+  private static class ByteBufferPool {
+
+    // TODO: make configurable?
+    private static final int BUF_SIZE = 16 * 1024;
+
+    private final ConcurrentLinkedQueue<ByteBuffer> pool = new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<ByteBuffer> out = new ConcurrentLinkedQueue<>();
+
+    private ByteBuffer getBuffer() {
+      ByteBuffer buffer = pool.poll();
+      if (buffer == null) {
+        buffer = ByteBuffer.allocate(BUF_SIZE);
+      }
+      out.offer(buffer);
+      return buffer;
+    }
+
+    private void resetPool() {
+      ByteBuffer buf = out.poll();
+      while (buf != null) {
+        pool.offer(buf);
+        buf = out.poll();
+      }
+    }
+  }
+
+  private static OptionalLong retryDelayNanos(java.net.http.HttpResponse<?> response) {
+    return RetryUtil.retryAfterNanos(response.headers().firstValue("Retry-After").orElse(null));
+  }
+
+  @Override
+  public CompletableResultCode shutdown() {
+    if (!managedExecutor) {
+      return closeClient();
+    }
+
+    // Use shutdownNow() to interrupt in-flight requests, including retry backoff sleeps
+    executorService.shutdownNow();
+
+    // Wait for threads to terminate in a background thread. Closing the client also blocks until
+    // in-flight requests complete, so it must not run on the caller's thread either.
+    CompletableResultCode result = new CompletableResultCode();
+    Thread terminationThread =
+        new Thread(
+            () -> {
+              try {
+                // Wait up to 5 seconds for threads to terminate
+                // Even if timeout occurs, we proceed since these are daemon threads
+                boolean terminated = executorService.awaitTermination(5, TimeUnit.SECONDS);
+                if (!terminated) {
+                  logger.log(
+                      Level.WARNING,
+                      "Executor did not terminate within 5 seconds, proceeding with shutdown since threads are daemon threads.");
+                }
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+              } finally {
+                CompletableResultCode closeResult = closeClient();
+                if (closeResult.isSuccess()) {
+                  result.succeed();
+                } else {
+                  result.failExceptionally(closeResult.getFailureThrowable());
+                }
+              }
+            },
+            "jdkhttp-shutdown");
+    terminationThread.setDaemon(true);
+    terminationThread.start();
+    return result;
+  }
+
+  private CompletableResultCode closeClient() {
+    if (AutoCloseable.class.isInstance(client)) {
+      try {
+        AutoCloseable.class.cast(client).close();
+      } catch (Exception e) {
+        return CompletableResultCode.ofExceptionalFailure(e);
+      }
+    }
+    return CompletableResultCode.ofSuccess();
+  }
+}

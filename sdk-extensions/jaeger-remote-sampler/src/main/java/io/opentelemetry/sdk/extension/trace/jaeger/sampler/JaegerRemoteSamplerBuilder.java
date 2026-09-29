@@ -1,0 +1,216 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.sdk.extension.trace.jaeger.sampler;
+
+import static java.util.Objects.requireNonNull;
+
+import io.grpc.ManagedChannel;
+import io.opentelemetry.api.internal.Utils;
+import io.opentelemetry.common.ComponentLoader;
+import io.opentelemetry.exporter.internal.EndpointUtil;
+import io.opentelemetry.exporter.internal.SenderUtil;
+import io.opentelemetry.exporter.internal.TlsConfigHelper;
+import io.opentelemetry.sdk.common.export.GrpcSender;
+import io.opentelemetry.sdk.common.export.GrpcSenderProvider;
+import io.opentelemetry.sdk.trace.samplers.Sampler;
+import java.net.URI;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+import javax.annotation.Nullable;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.X509TrustManager;
+
+/** A builder for {@link JaegerRemoteSampler}. */
+public final class JaegerRemoteSamplerBuilder {
+
+  private static final String GRPC_SERVICE_NAME = "jaeger.api_v2.SamplingManager";
+  private static final String GRPC_FULL_METHOD_NAME =
+      GRPC_SERVICE_NAME + "/" + "GetSamplingStrategy";
+
+  private static final String DEFAULT_ENDPOINT_URL = "http://localhost:14250";
+  private static final URI DEFAULT_ENDPOINT = URI.create(DEFAULT_ENDPOINT_URL);
+  private static final int DEFAULT_POLLING_INTERVAL_MILLIS = 60000;
+  private static final Sampler INITIAL_SAMPLER =
+      Sampler.parentBased(Sampler.traceIdRatioBased(0.001));
+  private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
+  private static final long DEFAULT_MAX_RESPONSE_BODY_SIZE = 4 * 1024L * 1024L;
+
+  private URI endpoint = DEFAULT_ENDPOINT;
+  private Sampler initialSampler = INITIAL_SAMPLER;
+  private int pollingIntervalMillis = DEFAULT_POLLING_INTERVAL_MILLIS;
+  private final TlsConfigHelper tlsConfigHelper = new TlsConfigHelper();
+  private Supplier<Map<String, String>> headerSupplier = Collections::emptyMap;
+  private long maxResponseBodySize = DEFAULT_MAX_RESPONSE_BODY_SIZE;
+
+  @Nullable private String serviceName;
+
+  // Use Object type since gRPC may not be on the classpath.
+  @Nullable private Object grpcChannel;
+
+  JaegerRemoteSamplerBuilder() {}
+
+  /**
+   * Sets the service name to be used by this exporter. Required.
+   *
+   * @param serviceName the service name.
+   * @return this.
+   */
+  public JaegerRemoteSamplerBuilder setServiceName(String serviceName) {
+    requireNonNull(serviceName, "serviceName");
+    this.serviceName = serviceName;
+    return this;
+  }
+
+  /**
+   * Sets the Jaeger endpoint to connect to. If unset, defaults to {@value DEFAULT_ENDPOINT_URL}.
+   */
+  public JaegerRemoteSamplerBuilder setEndpoint(String endpoint) {
+    requireNonNull(endpoint, "endpoint");
+    this.endpoint = EndpointUtil.validateEndpoint(endpoint);
+    return this;
+  }
+
+  /** Sets trusted certificate. */
+  public JaegerRemoteSamplerBuilder setTrustedCertificates(byte[] trustedCertificatesPem) {
+    requireNonNull(trustedCertificatesPem, "trustedCertificatesPem");
+    tlsConfigHelper.setTrustManagerFromCerts(trustedCertificatesPem);
+    return this;
+  }
+
+  /**
+   * Sets the client key and the certificate chain to use for verifying client when TLS is enabled.
+   * The key must be PKCS8, and both must be in PEM format.
+   *
+   * @since 1.24.0
+   */
+  public JaegerRemoteSamplerBuilder setClientTls(byte[] privateKeyPem, byte[] certificatePem) {
+    requireNonNull(privateKeyPem, "privateKeyPem");
+    requireNonNull(certificatePem, "certificatePem");
+    tlsConfigHelper.setKeyManagerFromCerts(privateKeyPem, certificatePem);
+    return this;
+  }
+
+  /**
+   * Sets the "bring-your-own" SSLContext for use with TLS. Users should call this _or_ set raw
+   * certificate bytes, but not both.
+   */
+  public JaegerRemoteSamplerBuilder setSslContext(
+      SSLContext sslContext, X509TrustManager trustManager) {
+    tlsConfigHelper.setSslContext(sslContext, trustManager);
+    return this;
+  }
+
+  /**
+   * Set the supplier of headers to add to requests. Applicable only if {@link
+   * JaegerRemoteSamplerBuilder#setChannel(ManagedChannel)} is not used to set channel.
+   */
+  // TODO(jack-berg): Make public
+  JaegerRemoteSamplerBuilder setHeaders(Supplier<Map<String, String>> headerSupplier) {
+    this.headerSupplier = headerSupplier;
+    return this;
+  }
+
+  /**
+   * Sets the polling interval for configuration updates. If unset, defaults to {@value
+   * DEFAULT_POLLING_INTERVAL_MILLIS}ms. Must be positive.
+   */
+  public JaegerRemoteSamplerBuilder setPollingInterval(int interval, TimeUnit unit) {
+    requireNonNull(unit, "unit");
+    Utils.checkArgument(interval > 0, "polling interval must be positive");
+    pollingIntervalMillis = (int) unit.toMillis(interval);
+    return this;
+  }
+
+  /**
+   * Sets the polling interval for configuration updates. If unset, defaults to {@value
+   * DEFAULT_POLLING_INTERVAL_MILLIS}ms.
+   */
+  public JaegerRemoteSamplerBuilder setPollingInterval(Duration interval) {
+    requireNonNull(interval, "interval");
+    return setPollingInterval((int) interval.toMillis(), TimeUnit.MILLISECONDS);
+  }
+
+  /**
+   * Sets the initial sampler that is used before sampling configuration is obtained. If unset,
+   * defaults to a parent-based ratio-based sampler with a ratio of 0.001.
+   */
+  public JaegerRemoteSamplerBuilder setInitialSampler(Sampler initialSampler) {
+    requireNonNull(initialSampler, "initialSampler");
+    this.initialSampler = initialSampler;
+    return this;
+  }
+
+  /**
+   * Sets the maximum number of bytes to read from a sampling strategy response body. If unset,
+   * defaults to 4 MiB. Must be positive.
+   *
+   * @since 1.61.0
+   */
+  public JaegerRemoteSamplerBuilder setMaxSamplingStrategyResponseBodySize(long bytes) {
+    Utils.checkArgument(bytes > 0, "maxSamplingStrategyResponseBodySize must be positive");
+    this.maxResponseBodySize = bytes;
+    return this;
+  }
+
+  /**
+   * Sets the managed channel to use when communicating with the backend. Takes precedence over
+   * {@link #setEndpoint(String)} if both are called.
+   *
+   * @deprecated Use {@link #setEndpoint(String)}. If you have a use case not satisfied by the
+   *     methods on this builder, please file an issue to let us know what it is.
+   */
+  @Deprecated
+  public JaegerRemoteSamplerBuilder setChannel(ManagedChannel channel) {
+    requireNonNull(channel, "channel");
+    this.grpcChannel = channel;
+    return this;
+  }
+
+  /**
+   * Builds the {@link JaegerRemoteSampler}.
+   *
+   * @return the remote sampler instance.
+   */
+  public JaegerRemoteSampler build() {
+    GrpcSender grpcSender = resolveGrpcSender();
+    return new JaegerRemoteSampler(
+        grpcSender, endpoint, serviceName, pollingIntervalMillis, initialSampler);
+  }
+
+  private GrpcSender resolveGrpcSender() {
+    ComponentLoader componentLoader =
+        ComponentLoader.forClassLoader(JaegerRemoteSamplerBuilder.class.getClassLoader());
+    GrpcSenderProvider grpcSenderProvider = SenderUtil.resolveGrpcSenderProvider(componentLoader);
+    Supplier<Map<String, List<String>>> headerSupplier =
+        () -> {
+          Map<String, List<String>> result = new HashMap<>();
+          Map<String, String> supplierResult = this.headerSupplier.get();
+          supplierResult.forEach((key, value) -> result.put(key, Collections.singletonList(value)));
+          return result;
+        };
+
+    ImmutableGrpcSenderConfig grpcSenderConfig =
+        ImmutableGrpcSenderConfig.create(
+            endpoint,
+            GRPC_FULL_METHOD_NAME,
+            null,
+            DEFAULT_TIMEOUT,
+            DEFAULT_TIMEOUT,
+            headerSupplier,
+            null,
+            tlsConfigHelper.getSslContext(),
+            tlsConfigHelper.getTrustManager(),
+            null,
+            grpcChannel,
+            maxResponseBodySize);
+    return grpcSenderProvider.createSender(grpcSenderConfig);
+  }
+}

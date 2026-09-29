@@ -1,0 +1,226 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.sdk.extension.trace.jaeger.sampler;
+
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.sdk.common.CompletableResultCode;
+import io.opentelemetry.sdk.common.export.GrpcResponse;
+import io.opentelemetry.sdk.common.export.GrpcSender;
+import io.opentelemetry.sdk.common.export.GrpcStatusCode;
+import io.opentelemetry.sdk.common.export.MessageWriter;
+import io.opentelemetry.sdk.common.internal.DaemonThreadFactory;
+import io.opentelemetry.sdk.trace.data.LinkData;
+import io.opentelemetry.sdk.trace.samplers.Sampler;
+import io.opentelemetry.sdk.trace.samplers.SamplingResult;
+import java.io.IOException;
+import java.net.URI;
+import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.Nullable;
+
+/** Remote sampler that gets sampling configuration from remote Jaeger server. */
+public final class JaegerRemoteSampler implements Sampler {
+  private static final Logger logger = Logger.getLogger(JaegerRemoteSampler.class.getName());
+
+  private static final String WORKER_THREAD_NAME =
+      JaegerRemoteSampler.class.getSimpleName() + "_WorkerThread";
+  private static final String TYPE = "remoteSampling";
+
+  private final String serviceName;
+  private final ScheduledExecutorService pollExecutor;
+  private final ScheduledFuture<?> pollFuture;
+
+  private volatile Sampler sampler;
+
+  private final AtomicBoolean isShutdown = new AtomicBoolean();
+
+  private final GrpcSender grpcSender;
+  private final URI endpoint;
+  private final int pollingIntervalMs;
+
+  JaegerRemoteSampler(
+      GrpcSender grpcSender,
+      URI endpoint,
+      @Nullable String serviceName,
+      int pollingIntervalMs,
+      Sampler initialSampler) {
+    this.serviceName = serviceName != null ? serviceName : "";
+    this.grpcSender = grpcSender;
+    this.endpoint = endpoint;
+    this.pollingIntervalMs = pollingIntervalMs;
+    this.sampler = initialSampler;
+    pollExecutor = Executors.newScheduledThreadPool(1, new DaemonThreadFactory(WORKER_THREAD_NAME));
+    pollFuture =
+        pollExecutor.scheduleWithFixedDelay(
+            this::getAndUpdateSampler, 0, pollingIntervalMs, TimeUnit.MILLISECONDS);
+  }
+
+  @Override
+  public SamplingResult shouldSample(
+      Context parentContext,
+      String traceId,
+      String name,
+      SpanKind spanKind,
+      Attributes attributes,
+      List<LinkData> parentLinks) {
+    return sampler.shouldSample(parentContext, traceId, name, spanKind, attributes, parentLinks);
+  }
+
+  private void getAndUpdateSampler() {
+    SamplingStrategyParametersMarshaler marshaler =
+        SamplingStrategyParametersMarshaler.create(this.serviceName);
+    try {
+      MessageWriter messageWriter = marshaler.toBinaryMessageWriter();
+      grpcSender.send(messageWriter, this::onResponse, this::onError);
+    } catch (Throwable e) { // Catch all to ensure scheduled task continues
+      logger.log(Level.WARNING, "Failed to update sampler", e);
+    }
+  }
+
+  private void onResponse(GrpcResponse grpcResponse) {
+    GrpcStatusCode statusCode = grpcResponse.getStatusCode();
+
+    if (statusCode == GrpcStatusCode.OK) {
+      if (isShutdown.get()) {
+        return;
+      }
+      try {
+        SamplingStrategyResponse strategyResponse =
+            SamplingStrategyResponseUnMarshaler.read(grpcResponse.getResponseMessage());
+        sampler = updateSampler(strategyResponse);
+      } catch (IOException e) {
+        logger.log(Level.WARNING, "Failed to unmarshal strategy response", e);
+      }
+      return;
+    }
+
+    switch (statusCode) {
+      case UNIMPLEMENTED:
+        logger.log(
+            levelOnFailure(Level.SEVERE),
+            "Failed to execute "
+                + TYPE
+                + "s. Server responded with UNIMPLEMENTED. "
+                + "Full error message: "
+                + grpcResponse.getStatusDescription());
+        break;
+      case UNAVAILABLE:
+        logger.log(
+            levelOnFailure(Level.SEVERE),
+            "Failed to execute "
+                + TYPE
+                + "s. Server is UNAVAILABLE. "
+                + "Make sure your service is running and reachable from this network. "
+                + "Full error message: "
+                + grpcResponse.getStatusDescription());
+        break;
+      default:
+        logger.log(
+            levelOnFailure(Level.WARNING),
+            "Failed to execute "
+                + TYPE
+                + "s. Server responded with gRPC status code "
+                + statusCode.name()
+                + ". Error message: "
+                + grpcResponse.getStatusDescription());
+        break;
+    }
+  }
+
+  private void onError(Throwable e) {
+    logger.log(
+        levelOnFailure(Level.SEVERE),
+        "Failed to execute " + TYPE + "s. The request could not be executed.",
+        e);
+    if (logger.isLoggable(Level.FINEST)) {
+      logger.log(Level.FINEST, "Failed to execute " + TYPE + "s. Details follow:", e);
+    }
+  }
+
+  // Failures after shutdown are typically caused by in-flight requests being cancelled by
+  // shutdown() and are not actionable, so demote them to FINE.
+  private Level levelOnFailure(Level defaultLevel) {
+    return isShutdown.get() ? Level.FINE : defaultLevel;
+  }
+
+  private static Sampler updateSampler(SamplingStrategyResponse response) throws IOException {
+    SamplingStrategyResponse.PerOperationSamplingStrategies operationSampling =
+        response.perOperationSamplingStrategies;
+    if (operationSampling.strategies.size() > 0) {
+      Sampler defaultSampler =
+          Sampler.traceIdRatioBased(operationSampling.defaultSamplingProbability);
+      return Sampler.parentBased(
+          new PerOperationSampler(defaultSampler, operationSampling.strategies));
+    }
+    switch (response.strategyType) {
+      case PROBABILISTIC:
+        return Sampler.parentBased(
+            Sampler.traceIdRatioBased(response.probabilisticSamplingStrategy.samplingRate));
+      case RATE_LIMITING:
+        return Sampler.parentBased(
+            new RateLimitingSampler(response.rateLimitingSamplingStrategy.maxTracesPerSecond));
+      case UNRECOGNIZED:
+        throw new IOException("unrecognized sampler type");
+    }
+    throw new IOException("unrecognized sampler type");
+  }
+
+  @Override
+  public String getDescription() {
+    return "JaegerRemoteSampler{sampler="
+        + this.sampler
+        + ", endpoint="
+        + this.endpoint
+        + ", pollingIntervalMs="
+        + this.pollingIntervalMs
+        + "}";
+  }
+
+  @Override
+  public String toString() {
+    return getDescription();
+  }
+
+  // Visible for testing
+  Sampler getSampler() {
+    return this.sampler;
+  }
+
+  public static JaegerRemoteSamplerBuilder builder() {
+    return new JaegerRemoteSamplerBuilder();
+  }
+
+  /**
+   * Shuts down the sampler, cancelling the polling task and shutting down the gRPC sender.
+   *
+   * @since 1.65.0
+   */
+  @Override
+  @SuppressWarnings("Interruption")
+  public CompletableResultCode shutdown() {
+    if (isShutdown.getAndSet(true)) {
+      return CompletableResultCode.ofSuccess();
+    }
+
+    pollFuture.cancel(true);
+    pollExecutor.shutdownNow();
+    return grpcSender.shutdown();
+  }
+
+  @Override
+  @Deprecated
+  public void close() {
+    shutdown();
+  }
+}

@@ -1,0 +1,48 @@
+import org.gradle.api.JavaVersion
+plugins {
+  id("otel.java-conventions")
+  id("org.graalvm.buildtools.native")
+}
+
+description = "OpenTelemetry Graal Integration Tests (Incubating)"
+otelJava.moduleName.set("io.opentelemetry.graal.integration.tests.incubating")
+otelJava.requireSuppressWarningsExplanation.set(false)
+otelJava.osgiEnabled.set(false)
+otelJava.minJavaVersionSupported.set(JavaVersion.VERSION_17)
+
+sourceSets {
+  main {
+    // We need to ensure that we have the shadowed classes on the classpath, without this
+    // we will get the <:sdk:trace-shaded-deps> classes only, without the shadowed ones
+    val traceShadedDeps = project(":sdk:trace-shaded-deps")
+    output.dir(traceShadedDeps.file("build/extracted/shadow"), "builtBy" to ":sdk:trace-shaded-deps:extractShadowJar")
+  }
+}
+
+dependencies {
+  implementation(project(":sdk:all"))
+  implementation(project(":sdk:trace-shaded-deps"))
+  implementation(project(":sdk:testing"))
+  implementation(project(":exporters:otlp:all"))
+  implementation(project(":api:incubator"))
+  implementation(project(":sdk-extensions:declarative-config"))
+}
+
+// org.graalvm.buildtools.native plugin requires java 17+ as of version 0.11.0
+// https://github.com/graalvm/native-build-tools/blob/master/docs/src/docs/asciidoc/index.adoc
+
+graalvmNative {
+  binaries {
+    named("test") {
+      // JUnit initialization is (mostly) handled automatically by the GraalVM plugin 0.11+
+      // Required as of junit 5.14.1
+      buildArgs.add("--initialize-at-build-time=org.junit.jupiter.engine.discovery.MethodSegmentResolver")
+    }
+  }
+  toolchainDetection.set(false)
+  // Disable metadata repository to work around configuration cache incompatibility
+  // https://github.com/graalvm/native-build-tools/issues/477
+  metadataRepository {
+    enabled.set(false)
+  }
+}

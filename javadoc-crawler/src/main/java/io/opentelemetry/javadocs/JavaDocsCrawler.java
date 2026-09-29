@@ -1,0 +1,313 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.javadocs;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.stream.Collectors;
+
+/**
+ * The javadoc.io site relies on someone accessing the page for an artifact version in order to
+ * update the contents of the site. This will query Maven Central for all artifacts under
+ * io.opentelemetry in order to identify the latest versions. Then it will crawl the associated
+ * pages on the javadoc.io site to trigger updates.
+ */
+public final class JavaDocsCrawler {
+  // Track list of groups and the minimum artifact versions that should be crawled. Update to the
+  // latest periodically to avoid crawling artifacts that stopped being published.
+  private static final Map<String, String> GROUPS_AND_MIN_VERSION =
+      Map.of(
+          "io.opentelemetry", "1.60.1",
+          "io.opentelemetry.instrumentation", "2.25.0",
+          "io.opentelemetry.contrib", "1.54.0",
+          "io.opentelemetry.semconv", "1.40.0",
+          "io.opentelemetry.proto", "1.10.0");
+
+  private static final String MAVEN_CENTRAL_BASE_URL =
+      "https://central.sonatype.com/solrsearch/select?q=g:";
+  private static final String JAVA_DOCS_BASE_URL = "https://javadoc.io/doc/";
+  // Every group is fetched in a single request, so no paging parameter is sent. The largest group
+  // currently holds fewer than 200 artifacts and getArtifacts fails if the response is incomplete.
+  private static final int MAX_ROWS = 500;
+  private static final int THROTTLE_MS = 500;
+
+  // visible for testing
+  static final String JAVA_DOC_DOWNLOADED_TEXT = "Javadoc is being downloaded";
+
+  private static final Logger logger = Logger.getLogger(JavaDocsCrawler.class.getName());
+  private static final ObjectMapper objectMapper = new ObjectMapper();
+
+  public static void main(String[] args) throws Exception {
+    HttpClient client = HttpClient.newHttpClient();
+
+    for (Map.Entry<String, String> groupAndMinVersion : GROUPS_AND_MIN_VERSION.entrySet()) {
+      String group = groupAndMinVersion.getKey();
+
+      List<Artifact> artifacts = getArtifacts(client, group);
+      if (artifacts.isEmpty()) {
+        logger.log(Level.SEVERE, "No artifacts found for group " + group);
+        continue;
+      }
+      logger.info(
+          String.format(Locale.ROOT, "Found %d artifacts for group " + group, artifacts.size()));
+
+      List<Artifact> updated = crawlJavaDocs(client, groupAndMinVersion.getValue(), artifacts);
+      if (updated.isEmpty()) {
+        logger.info("No updates were needed for group " + group);
+        continue;
+      }
+
+      logger.info(
+          "Artifacts that triggered updates for group "
+              + group
+              + ":\n"
+              + updated.stream().map(Artifact::toString).collect(Collectors.joining("\n")));
+    }
+  }
+
+  static List<Artifact> getArtifacts(HttpClient client, String group)
+      throws IOException, InterruptedException {
+    Map<?, ?> map = queryMavenCentral(client, group, MAX_ROWS);
+
+    // a 200 response without numFound means the endpoint changed shape; failing here keeps that
+    // from silently disabling the completeness check below
+    int numFound =
+        Optional.ofNullable(map)
+            .map(mavenResult -> (Map<?, ?>) mavenResult.get("response"))
+            .map(response -> (Integer) response.get("numFound"))
+            .orElseThrow(
+                () ->
+                    new IOException(
+                        "Maven Central response for group "
+                            + group
+                            + " did not contain response.numFound"));
+
+    List<Artifact> artifacts = convertToArtifacts(map);
+    if (artifacts.size() < numFound) {
+      throw new IOException(
+          String.format(
+              Locale.ROOT,
+              "Received %d of %d artifacts for group %s, raise MAX_ROWS",
+              artifacts.size(),
+              numFound,
+              group));
+    }
+
+    return artifacts;
+  }
+
+  private static List<Artifact> convertToArtifacts(Map<?, ?> map) {
+    return Optional.ofNullable(map)
+        .map(mavenResults -> (Map<?, ?>) mavenResults.get("response"))
+        .map(response -> (List<?>) response.get("docs"))
+        .map(
+            docs -> {
+              List<Artifact> artifacts = new ArrayList<>();
+              for (Object doc : docs) {
+                Map<?, ?> docMap = (Map<?, ?>) doc;
+                String group = Objects.requireNonNull((String) docMap.get("g"), "g");
+                String artifact = Objects.requireNonNull((String) docMap.get("a"), "a");
+                String version =
+                    Objects.requireNonNull((String) docMap.get("latestVersion"), "latestVersion");
+                artifacts.add(new Artifact(Objects.requireNonNull(group), artifact, version));
+              }
+              return artifacts;
+            })
+        .orElseGet(ArrayList::new);
+  }
+
+  private static Map<?, ?> queryMavenCentral(HttpClient client, String group, int rows)
+      throws IOException, InterruptedException {
+    URI uri =
+        URI.create(
+            String.format(
+                Locale.ROOT, "%s%s&rows=%d&wt=json", MAVEN_CENTRAL_BASE_URL, group, rows));
+
+    HttpRequest request = HttpRequest.newBuilder(uri).GET().build();
+
+    HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+    if (response.statusCode() != 200) {
+      logger.log(
+          Level.SEVERE,
+          "Unexpected response code "
+              + response.statusCode()
+              + " for uri: "
+              + uri.toASCIIString()
+              + "\n"
+              + response.body());
+      throw new IOException("Unable to pull Maven central artifacts list");
+    }
+    return objectMapper.readValue(response.body(), Map.class);
+  }
+
+  static List<Artifact> crawlJavaDocs(
+      HttpClient client, String minVersion, List<Artifact> artifacts)
+      throws IOException, InterruptedException {
+    List<Artifact> updatedArtifacts = new ArrayList<>();
+    SemanticVersion minSemanticVersion = SemanticVersion.parse(minVersion);
+
+    for (Artifact artifact : artifacts) {
+      if (SemanticVersion.parse(artifact.getVersion()).compareTo(minSemanticVersion) < 0) {
+        logger.info(
+            String.format(
+                "Skipping crawling %s due to version %s being less than minVersion %s",
+                artifact, artifact.getVersion(), minVersion));
+        continue;
+      }
+
+      String[] parts = artifact.getName().split("-");
+      StringBuilder path = new StringBuilder();
+      path.append(JAVA_DOCS_BASE_URL)
+          .append(artifact.getGroup())
+          .append("/")
+          .append(artifact.getName())
+          .append("/")
+          .append(artifact.getVersion())
+          .append("/")
+          .append(String.join("/", parts))
+          .append("/package-summary.html");
+
+      HttpRequest crawlRequest = HttpRequest.newBuilder(URI.create(path.toString())).GET().build();
+      logger.info(String.format("Crawling %s at: %s", artifact, path));
+      HttpResponse<String> crawlResponse =
+          client.send(crawlRequest, HttpResponse.BodyHandlers.ofString());
+
+      // gets a status code 303 when version exists and the site redirects it to use /latest/
+      if (crawlResponse.statusCode() != 200 && crawlResponse.statusCode() != 303) {
+        logger.log(
+            Level.WARNING,
+            String.format(
+                Locale.ROOT,
+                "Crawl failed for %s with status code %d at URL %s\nResponse: %s",
+                artifact,
+                crawlResponse.statusCode(),
+                path,
+                crawlResponse.body()));
+        continue;
+      }
+
+      if (crawlResponse.body().contains(JAVA_DOC_DOWNLOADED_TEXT)) {
+        updatedArtifacts.add(artifact);
+      }
+
+      Thread.sleep(THROTTLE_MS); // some light throttling
+    }
+    return updatedArtifacts;
+  }
+
+  static final class SemanticVersion implements Comparable<SemanticVersion> {
+    private static final Comparator<List<Integer>> CORE_VERSION_COMPARATOR =
+        (left, right) -> {
+          for (int i = 0; i < Math.max(left.size(), right.size()); i++) {
+            int leftPart = i < left.size() ? left.get(i) : 0;
+            int rightPart = i < right.size() ? right.get(i) : 0;
+            int result = Integer.compare(leftPart, rightPart);
+            if (result != 0) {
+              return result;
+            }
+          }
+          return 0;
+        };
+
+    private final List<Integer> coreVersionParts;
+    private final String qualifier;
+
+    private SemanticVersion(List<Integer> coreVersionParts, String qualifier) {
+      this.coreVersionParts = coreVersionParts;
+      this.qualifier = qualifier;
+    }
+
+    static SemanticVersion parse(String version) {
+      String[] versionParts = version.split("-", 2);
+      List<Integer> coreVersionParts = new ArrayList<>();
+      for (String part : versionParts[0].split("\\.")) {
+        coreVersionParts.add(Integer.parseInt(part));
+      }
+      String qualifier = versionParts.length == 2 ? versionParts[1] : "";
+      return new SemanticVersion(coreVersionParts, qualifier);
+    }
+
+    @Override
+    public int compareTo(SemanticVersion other) {
+      int coreVersionResult =
+          CORE_VERSION_COMPARATOR.compare(coreVersionParts, other.coreVersionParts);
+      if (coreVersionResult != 0) {
+        return coreVersionResult;
+      }
+      if (qualifier.isEmpty() && other.qualifier.isEmpty()) {
+        return 0;
+      }
+      if (qualifier.isEmpty()) {
+        return 1;
+      }
+      if (other.qualifier.isEmpty()) {
+        return -1;
+      }
+      return compareQualifier(qualifier, other.qualifier);
+    }
+
+    private static int compareQualifier(String leftQualifier, String rightQualifier) {
+      String[] leftParts = leftQualifier.split("\\.");
+      String[] rightParts = rightQualifier.split("\\.");
+
+      for (int i = 0; i < Math.max(leftParts.length, rightParts.length); i++) {
+        if (i >= leftParts.length) {
+          return -1;
+        }
+        if (i >= rightParts.length) {
+          return 1;
+        }
+
+        String leftIdentifier = leftParts[i];
+        String rightIdentifier = rightParts[i];
+        if (leftIdentifier.equals(rightIdentifier)) {
+          continue;
+        }
+
+        boolean leftNumeric = isNumericIdentifier(leftIdentifier);
+        boolean rightNumeric = isNumericIdentifier(rightIdentifier);
+        if (leftNumeric && rightNumeric) {
+          if (leftIdentifier.length() != rightIdentifier.length()) {
+            return Integer.compare(leftIdentifier.length(), rightIdentifier.length());
+          }
+          return leftIdentifier.compareTo(rightIdentifier);
+        }
+        if (leftNumeric != rightNumeric) {
+          return leftNumeric ? -1 : 1;
+        }
+        return leftIdentifier.compareTo(rightIdentifier);
+      }
+      return 0;
+    }
+
+    private static boolean isNumericIdentifier(String identifier) {
+      if (identifier.isEmpty()) {
+        return false;
+      }
+      for (int i = 0; i < identifier.length(); i++) {
+        if (!Character.isDigit(identifier.charAt(i))) {
+          return false;
+        }
+      }
+      return true;
+    }
+  }
+
+  private JavaDocsCrawler() {}
+}

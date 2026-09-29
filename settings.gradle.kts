@@ -1,0 +1,130 @@
+pluginManagement {
+  plugins {
+    id("com.gradleup.shadow") version "9.6.1"
+    id("com.gradle.develocity") version "4.5.1"
+    id("de.undercouch.download") version "5.7.0"
+    id("io.github.gradle-nexus.publish-plugin") version "2.0.0"
+    id("org.graalvm.buildtools.native") version "1.1.13"
+    id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
+  }
+}
+
+plugins {
+  id("com.gradle.develocity")
+  id("org.gradle.toolchains.foojay-resolver-convention")
+}
+
+dependencyResolutionManagement {
+  repositories {
+    mavenCentral()
+    google()
+    mavenLocal()
+  }
+}
+
+rootProject.name = "opentelemetry-java"
+include(":all")
+include(":api:all")
+include(":api:incubator")
+include(":api:testing-internal")
+include(":bom")
+include(":bom-alpha")
+include(":common")
+include(":context")
+include(":custom-checks")
+include(":dependencyManagement")
+include(":extensions:kotlin")
+include(":extensions:trace-propagators")
+include(":exporters:common")
+include(":exporters:common:compile-stub")
+include(":exporters:sender:grpc-managed-channel")
+include(":exporters:sender:jdk")
+include(":exporters:sender:okhttp")
+include(":exporters:logging")
+include(":exporters:logging-otlp")
+include(":exporters:otlp:all")
+include(":exporters:otlp:common")
+include(":exporters:otlp:profiles")
+include(":exporters:otlp:testing-internal")
+include(":exporters:prometheus")
+include(":integration-tests")
+include(":integration-tests:otlp")
+include(":integration-tests:tracecontext")
+include(":integration-tests:graal")
+include(":integration-tests:graal-incubating")
+include(":integration-tests:osgi")
+include(":javadoc-crawler")
+include(":opencensus-shim")
+include(":opentelemetry-jfr-profiles-shim")
+include(":opentracing-shim")
+include(":perf-harness")
+include(":sdk:all")
+include(":sdk:common")
+include(":sdk:logs")
+include(":sdk:metrics")
+include(":sdk:profiles")
+include(":sdk:testing")
+include(":sdk:trace")
+include(":sdk:trace-shaded-deps")
+include(":sdk-extensions:autoconfigure")
+include(":sdk-extensions:autoconfigure-spi")
+include(":sdk-extensions:declarative-config")
+include(":sdk-extensions:incubator")
+include(":sdk-extensions:jaeger-remote-sampler")
+include(":testing-internal")
+include(":animal-sniffer-signature")
+
+val develocityServer = "https://community.develocity.cloud"
+val isCI = System.getenv("CI") != null
+val develocityAccessKey = System.getenv("DEVELOCITY_ACCESS_KEY") ?: ""
+val disableRemoteBuildCache = System.getenv("DISABLE_REMOTE_BUILD_CACHE") != null
+val isRemoteBuildCachePushEnabled =
+  isCI && develocityAccessKey.isNotEmpty() && !disableRemoteBuildCache
+val shouldDisableLocalBuildCache =
+  isRemoteBuildCachePushEnabled && System.getenv("GITHUB_REF_NAME") == "main"
+
+develocity {
+  if (develocityAccessKey.isNotEmpty()) {
+    server = develocityServer
+    projectId = "OpenTelemetry"
+  }
+
+  buildScan {
+    if (develocityAccessKey.isNotEmpty()) {
+      gradle.startParameter.projectProperties["testJavaVersion"]?.let { tag(it) }
+      gradle.startParameter.projectProperties["testJavaVM"]?.let { tag(it) }
+      gradle.startParameter.projectProperties["smokeTestSuite"]?.let {
+        value("Smoke test suite", it)
+      }
+    } else if (isCI) {
+      termsOfUseUrl = "https://gradle.com/help/legal-terms-of-use"
+      termsOfUseAgree = "yes"
+    } else {
+      publishing.onlyIf { false }
+    }
+
+    capture {
+      fileFingerprints = true
+    }
+
+    buildScanPublished {
+      File("build-scan.txt").printWriter().use { writer ->
+        writer.println(buildScanUri)
+      }
+    }
+  }
+}
+
+buildCache {
+  // Tasks loaded from the local cache are not pushed to the remote cache. Disable the local cache
+  // on default-branch CI builds so executed tasks populate the authenticated Develocity cache.
+  local {
+    isEnabled = !shouldDisableLocalBuildCache
+  }
+
+  remote(develocity.buildCache) {
+    server = develocityServer
+    isEnabled = !disableRemoteBuildCache
+    isPush = isRemoteBuildCachePushEnabled
+  }
+}

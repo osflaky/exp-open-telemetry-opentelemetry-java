@@ -1,0 +1,318 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.exporter.sender.okhttp.internal;
+
+import io.opentelemetry.api.impl.InstrumentationUtil;
+import io.opentelemetry.exporter.internal.RetryUtil;
+import io.opentelemetry.exporter.internal.TlsUtil;
+import io.opentelemetry.sdk.common.CompletableResultCode;
+import io.opentelemetry.sdk.common.export.Compressor;
+import io.opentelemetry.sdk.common.export.HttpResponse;
+import io.opentelemetry.sdk.common.export.HttpSender;
+import io.opentelemetry.sdk.common.export.MessageWriter;
+import io.opentelemetry.sdk.common.export.ProxyOptions;
+import io.opentelemetry.sdk.common.export.RetryPolicy;
+import java.io.IOException;
+import java.net.URI;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.OptionalLong;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.Nullable;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLException;
+import javax.net.ssl.X509TrustManager;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.ConnectionSpec;
+import okhttp3.Dispatcher;
+import okhttp3.HttpUrl;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+import okhttp3.TlsVersion;
+import okio.Buffer;
+import okio.BufferedSink;
+import okio.GzipSource;
+import okio.Okio;
+import okio.Source;
+
+/**
+ * {@link HttpSender} which is backed by OkHttp.
+ *
+ * <p>This class is internal and is hence not for public use. Its APIs are unstable and can change
+ * at any time.
+ */
+public final class OkHttpHttpSender implements HttpSender {
+
+  private static final Logger logger = Logger.getLogger(OkHttpHttpSender.class.getName());
+
+  private final boolean managedExecutor;
+  private final OkHttpClient client;
+  private final HttpUrl url;
+  private final Supplier<Map<String, List<String>>> headerSupplier;
+  private final MediaType mediaType;
+  @Nullable private final Compressor compressor;
+  private final long maxResponseBodySize;
+
+  /** Create a sender. */
+  @SuppressWarnings("TooManyParameters")
+  public OkHttpHttpSender(
+      URI endpoint,
+      String contentType,
+      @Nullable Compressor compressor,
+      Duration timeout,
+      Duration connectTimeout,
+      Supplier<Map<String, List<String>>> headerSupplier,
+      @Nullable ProxyOptions proxyOptions,
+      @Nullable RetryPolicy retryPolicy,
+      @Nullable SSLContext sslContext,
+      @Nullable X509TrustManager trustManager,
+      @Nullable ExecutorService executorService,
+      long maxResponseBodySize,
+      @Nullable List<String> enabledProtocols) {
+    int callTimeoutMillis = (int) Math.min(timeout.toMillis(), Integer.MAX_VALUE);
+    int connectTimeoutMillis = (int) Math.min(connectTimeout.toMillis(), Integer.MAX_VALUE);
+
+    Dispatcher dispatcher;
+    if (executorService == null) {
+      dispatcher = OkHttpUtil.newDispatcher();
+      this.managedExecutor = true;
+    } else {
+      dispatcher = new Dispatcher(executorService);
+      this.managedExecutor = false;
+    }
+
+    OkHttpClient.Builder builder =
+        new OkHttpClient.Builder()
+            .dispatcher(dispatcher)
+            .connectTimeout(Duration.ofMillis(connectTimeoutMillis))
+            .callTimeout(Duration.ofMillis(callTimeoutMillis));
+
+    if (proxyOptions != null) {
+      builder.proxySelector(proxyOptions.getProxySelector());
+    }
+
+    if (retryPolicy != null) {
+      builder.addInterceptor(
+          new RetryInterceptor(
+              retryPolicy, OkHttpHttpSender::isRetryable, OkHttpHttpSender::retryDelayNanos));
+    }
+
+    boolean isPlainHttp = endpoint.getScheme().equals("http");
+    if (isPlainHttp) {
+      builder.connectionSpecs(Collections.singletonList(ConnectionSpec.CLEARTEXT));
+    } else {
+      if (sslContext != null) {
+        X509TrustManager effectiveTrustManager = trustManager;
+        if (effectiveTrustManager == null) {
+          try {
+            effectiveTrustManager = TlsUtil.defaultTrustManager();
+          } catch (SSLException e) {
+            throw new IllegalStateException("Unable to initialize default trust manager", e);
+          }
+        }
+        builder.sslSocketFactory(sslContext.getSocketFactory(), effectiveTrustManager);
+      }
+      if (enabledProtocols != null && !enabledProtocols.isEmpty()) {
+        TlsVersion[] versions =
+            enabledProtocols.stream().map(TlsVersion::forJavaName).toArray(TlsVersion[]::new);
+        builder.connectionSpecs(
+            Collections.singletonList(
+                new ConnectionSpec.Builder(ConnectionSpec.COMPATIBLE_TLS)
+                    .tlsVersions(versions)
+                    .build()));
+      }
+    }
+
+    this.client = builder.build();
+    this.url = HttpUrl.get(endpoint);
+    this.mediaType = MediaType.parse(contentType);
+    this.compressor = compressor;
+    this.headerSupplier = headerSupplier;
+    this.maxResponseBodySize = maxResponseBodySize;
+  }
+
+  private static OptionalLong retryDelayNanos(Response response) {
+    return RetryUtil.retryAfterNanos(response.header("Retry-After"));
+  }
+
+  @Override
+  public void send(
+      MessageWriter messageWriter, Consumer<HttpResponse> onResponse, Consumer<Throwable> onError) {
+    Request.Builder requestBuilder = new Request.Builder().url(url);
+
+    Map<String, List<String>> headers = headerSupplier.get();
+    if (headers != null) {
+      headers.forEach(
+          (key, values) -> values.forEach(value -> requestBuilder.addHeader(key, value)));
+    }
+    if (compressor != null) {
+      requestBuilder.addHeader("Content-Encoding", compressor.getEncoding());
+    }
+    // Explicitly advertise gzip and identity encoding support. Because we set Accept-Encoding
+    // ourselves, OkHttp's BridgeInterceptor will not transparently decompress gzip responses
+    // (it only does so when it added the header), so we handle decompression ourselves below.
+    requestBuilder.addHeader("Accept-Encoding", "gzip, identity");
+    requestBuilder.post(new RequestBodyImpl(messageWriter, compressor, mediaType));
+
+    try {
+      InstrumentationUtil.suppressInstrumentation(
+          () ->
+              client
+                  .newCall(requestBuilder.build())
+                  .enqueue(
+                      new Callback() {
+                        @Override
+                        public void onFailure(Call call, IOException e) {
+                          onError.accept(e);
+                        }
+
+                        @Override
+                        public void onResponse(Call call, Response response) {
+                          handleResponse(response, onResponse, onError);
+                        }
+                      }));
+    } catch (RejectedExecutionException e) {
+      onError.accept(e);
+    }
+  }
+
+  private void handleResponse(
+      Response response, Consumer<HttpResponse> onResponse, Consumer<Throwable> onError) {
+    try (ResponseBody body = response.body()) {
+      String contentEncoding = response.header("Content-Encoding");
+      if (contentEncoding != null
+          && !"gzip".equalsIgnoreCase(contentEncoding)
+          && !"identity".equalsIgnoreCase(contentEncoding)) {
+        onError.accept(new IOException("Unsupported Content-Encoding: " + contentEncoding));
+        return;
+      }
+      boolean decompress = "gzip".equalsIgnoreCase(contentEncoding);
+      // Read up to maxResponseBodySize + 1 bytes. Reading exactly one byte more than the limit
+      // lets us detect overflow: if the buffer ends up larger than maxResponseBodySize, the body
+      // exceeded the limit. A body exactly at the limit will only fill the buffer to
+      // maxResponseBodySize (EOF is reached before the extra byte is read).
+      // If maxResponseBodySize is Long.MAX_VALUE, adding 1 would overflow. In that case use
+      // Long.MAX_VALUE directly — the overflow check can never trigger for such a large limit.
+      long readUpTo =
+          maxResponseBodySize == Long.MAX_VALUE ? Long.MAX_VALUE : maxResponseBodySize + 1;
+      Buffer buffer = new Buffer();
+      try {
+        Source source = decompress ? new GzipSource(body.source()) : body.source();
+        while (buffer.size() <= maxResponseBodySize) {
+          long n = source.read(buffer, readUpTo - buffer.size());
+          if (n == -1L) {
+            break;
+          }
+        }
+      } catch (IOException e) {
+        logger.log(Level.WARNING, "Failed to read response body", e);
+      }
+
+      if (buffer.size() > maxResponseBodySize) {
+        onError.accept(
+            new IOException(
+                "HTTP response body exceeded limit of " + maxResponseBodySize + " bytes"));
+        return;
+      }
+
+      byte[] bodyBytes = buffer.readByteArray();
+      onResponse.accept(
+          ImmutableHttpResponse.create(response.code(), response.message(), bodyBytes));
+    }
+  }
+
+  @Override
+  public CompletableResultCode shutdown() {
+    client.dispatcher().cancelAll();
+    client.connectionPool().evictAll();
+
+    if (managedExecutor) {
+      ExecutorService executorService = client.dispatcher().executorService();
+      // Use shutdownNow() to interrupt idle threads immediately since we've cancelled all work
+      executorService.shutdownNow();
+
+      // Wait for threads to terminate in a background thread
+      CompletableResultCode result = new CompletableResultCode();
+      Thread terminationThread =
+          new Thread(
+              () -> {
+                try {
+                  // Wait up to 5 seconds for threads to terminate
+                  // Even if timeout occurs, we succeed since these are daemon threads
+                  boolean terminated = executorService.awaitTermination(5, TimeUnit.SECONDS);
+                  if (!terminated) {
+                    logger.log(
+                        Level.WARNING,
+                        "Executor did not terminate within 5 seconds, proceeding with shutdown since threads are daemon threads.");
+                  }
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                } finally {
+                  result.succeed();
+                }
+              },
+              "okhttp-shutdown");
+      terminationThread.setDaemon(true);
+      terminationThread.start();
+      return result;
+    }
+
+    return CompletableResultCode.ofSuccess();
+  }
+
+  static boolean isRetryable(Response response) {
+    return RetryUtil.retryableHttpResponseCodes().contains(response.code());
+  }
+
+  private static class RequestBodyImpl extends RequestBody {
+
+    private final MessageWriter requestBodyWriter;
+    @Nullable private final Compressor compressor;
+    private final MediaType mediaType;
+
+    private RequestBodyImpl(
+        MessageWriter requestBodyWriter, @Nullable Compressor compressor, MediaType mediaType) {
+      this.requestBodyWriter = requestBodyWriter;
+      this.compressor = compressor;
+      this.mediaType = mediaType;
+    }
+
+    @Override
+    public long contentLength() {
+      return compressor == null ? requestBodyWriter.getContentLength() : -1;
+    }
+
+    @Override
+    public MediaType contentType() {
+      return mediaType;
+    }
+
+    @Override
+    public void writeTo(BufferedSink bufferedSink) throws IOException {
+      if (compressor != null) {
+        BufferedSink compressedSink =
+            Okio.buffer(Okio.sink(compressor.compress(bufferedSink.outputStream())));
+        requestBodyWriter.writeMessage(compressedSink.outputStream());
+        compressedSink.close();
+      } else {
+        requestBodyWriter.writeMessage(bufferedSink.outputStream());
+      }
+    }
+  }
+}
